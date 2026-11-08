@@ -629,6 +629,10 @@ pub enum StreamKind {
         /// that is already running: the address above is then this computer.
         #[serde(default, skip_serializing_if = "is_false")]
         host_here: bool,
+        /// The H.264 encoder to use (FFmpeg's name, `h264_amf`), or empty to
+        /// let NewQ pick the first one that works.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        encoder: String,
     },
 }
 
@@ -683,6 +687,7 @@ impl StreamKind {
             adapter: String::new(),
             player_port: default_player_port(),
             host_here: false,
+            encoder: String::new(),
         }
     }
 }
@@ -4347,6 +4352,7 @@ mod tests {
                 adapter: "en0".into(),
                 player_port: 8890,
                 host_here: true,
+                encoder: "libopenh264".into(),
             },
             fps: 30,
             height: 1080,
@@ -4381,7 +4387,7 @@ mod tests {
         );
         // Written again, the new fields are left out while they hold their defaults...
         let json = serde_json::to_string(&s).unwrap();
-        for field in ["adapter", "player_port", "host_here"] {
+        for field in ["adapter", "player_port", "host_here", "encoder"] {
             assert!(!json.contains(field), "{field} written: {json}");
         }
         // ...and kept once they are set.
@@ -4390,15 +4396,17 @@ mod tests {
             adapter,
             player_port,
             host_here,
+            encoder,
             ..
         } = &mut set.kind
         {
+            *encoder = "h264_amf".into();
             *adapter = "en0".into();
             *player_port = 8890;
             *host_here = true;
         }
         let json = serde_json::to_string(&set).unwrap();
-        for field in ["adapter", "player_port", "host_here"] {
+        for field in ["adapter", "player_port", "host_here", "encoder"] {
             assert!(json.contains(field), "{field} lost: {json}");
         }
         assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), set);

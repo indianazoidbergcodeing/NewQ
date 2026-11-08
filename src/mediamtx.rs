@@ -718,6 +718,12 @@ mod tests {
                 .is_ok()
         });
         assert!(up, "the RTSP port never opened: {:?}", server.state());
+        // The web player's port opens a little after RTSP's.
+        assert!(
+            wait_for(hosting.player),
+            "the web player port never opened: {:?}",
+            server.state()
+        );
         assert_eq!(server.state(), State::Running);
         let probes = crate::streamlink::probe_server(
             crate::show::ServerProtocol::Rtsp,
@@ -930,6 +936,7 @@ mod tests {
             adapter: adapter.into(),
             player_port: player,
             host_here: here,
+            encoder: String::new(),
         }
     }
 
