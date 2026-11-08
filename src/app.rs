@@ -257,11 +257,14 @@ pub struct App {
     patterns: HashMap<OutputId, Pattern>,
     /// The displays whose picture is being sent out.
     streams: HashMap<OutputId, RunningStream>,
-    /// The streaming server NewQ itself runs for the streams that ask for it.
-    hosted: Option<crate::mediamtx::Hosted>,
-    /// What it was last asked to be and when it stopped, so a server that
-    /// can't start (a port in use) is tried again slowly, not every frame.
-    hosted_failed: Option<(crate::mediamtx::Hosting, Instant)>,
+    /// The streaming server NewQ itself runs for the streams that ask for it,
+    /// on a thread of its own (made when first wanted).
+    hosting_runner: Option<crate::mediamtx::Runner>,
+    /// What the streams ask of it and since when, so that a change is acted on
+    /// once it has stopped changing (typing a port restarts nothing), and what
+    /// the runner was last told.
+    hosting_seen: (Option<crate::mediamtx::Hosting>, Instant),
+    hosting_sent: Option<crate::mediamtx::Hosting>,
     adapters: (Instant, Vec<crate::streamlink::Adapter>),
     /// Streams that failed to start or stopped, by display, so they are not
     /// tried again until their settings change.
@@ -425,8 +428,9 @@ impl App {
             last_sizes: HashMap::new(),
             patterns: HashMap::new(),
             streams: HashMap::new(),
-            hosted: None,
-            hosted_failed: None,
+            hosting_runner: None,
+            hosting_seen: (None, Instant::now()),
+            hosting_sent: None,
             adapters: (Instant::now() - Duration::from_secs(60), Vec::new()),
             stream_failed: HashMap::new(),
             stream_seen: HashMap::new(),
@@ -1339,104 +1343,88 @@ impl App {
         self.closing.retain(|(_, h)| !h.is_finished());
     }
 
-    /// Run, restart or stop the streaming server inside NewQ, as the streams
-    /// that are on ask for. Its state is reported to the UI.
-    fn update_hosting(&mut self) {
-        use crate::mediamtx::{Hosted, Hosting, State};
+    /// Ask for the streaming server inside NewQ to run, change or stop, as the
+    /// streams that are on want, and report how it is doing to the UI. The
+    /// server itself is started and stopped on its own thread. Returns what the
+    /// streams that run it must be made to agree on (`mediamtx::align`).
+    fn update_hosting(&mut self) -> Option<crate::mediamtx::Plan> {
+        use crate::mediamtx::{Runner, Status};
         use crate::show::StreamKind;
-        let ask = self
+        // Ticking "Run the server in NewQ" (or its Allow button) allows it here.
+        if self.ui.hosting_allow_request.take() && !self.ui.prefs.allow_hosting {
+            self.ui.prefs.allow_hosting = true;
+            if let Some(dir) = &self.ui.layout_dir
+                && let Err(e) = self.ui.prefs.save(dir)
+            {
+                log::warn!("could not save the settings of this computer: {e}");
+            }
+        }
+        // The streams that are sent (the same ones `update_streams` starts).
+        let kinds: Vec<StreamKind> = self
             .show
             .outputs
             .iter()
-            .filter(|o| o.enabled)
+            .filter(|o| o.enabled && !o.is_sub_display() && self.show.part_of(o.id).is_none())
             .filter_map(|o| o.stream.as_ref().filter(|s| s.enabled))
-            .find_map(|s| match &s.kind {
+            .map(|s| s.kind.clone())
+            .collect();
+        let hosts = kinds.iter().any(|k| {
+            matches!(
+                k,
                 StreamKind::Server {
                     host_here: true,
-                    adapter,
-                    port,
-                    protocol,
-                    player_port,
                     ..
-                } => Some((adapter.clone(), *protocol, *port, *player_port)),
-                _ => None,
-            });
-        let Some((adapter, protocol, port, player_port)) = ask else {
-            if self.hosted.take().is_some() {
-                self.engine.log("Streaming server stopped");
-            }
-            self.hosted_failed = None;
-            self.ui.hosting = crate::ui::HostingStatus::Off;
-            return;
-        };
-        if self.adapters.0.elapsed() > Duration::from_secs(5) {
+                }
+            )
+        });
+        if hosts && self.adapters.0.elapsed() > Duration::from_secs(5) {
             self.adapters = (Instant::now(), crate::streamlink::adapters());
         }
-        let mut hosting =
-            Hosting::standard(crate::streamlink::adapter_ip(&adapter, &self.adapters.1));
-        // The port the stream publishes to is the one the server opens.
-        let port = if port == 0 {
-            protocol.default_port()
-        } else {
-            port
-        };
-        match protocol {
-            crate::show::ServerProtocol::Rtsp => hosting.rtsp = port,
-            crate::show::ServerProtocol::Rtmp => hosting.rtmp = port,
-            crate::show::ServerProtocol::Srt => hosting.srt = port,
+        let plan = hosts
+            .then(|| crate::mediamtx::plan(kinds.iter(), &self.adapters.1))
+            .flatten();
+        // What may run: not with an adapter that isn't there (the server would
+        // listen on every adapter instead), and not before this computer has
+        // been allowed.
+        let missing_adapter = plan
+            .as_ref()
+            .is_some_and(|p| !p.adapter.is_empty() && p.hosting.listen.is_none());
+        let allowed = self.ui.prefs.allow_hosting;
+        let desired = plan
+            .as_ref()
+            .filter(|_| !missing_adapter && allowed)
+            .map(|p| p.hosting);
+        if self.hosting_seen.0 != desired {
+            self.hosting_seen = (desired, Instant::now());
         }
-        if player_port != 0 {
-            hosting.player = player_port;
-        }
-        if self.hosted.as_ref().is_some_and(|h| h.hosting != hosting) {
-            self.hosted = None;
-            self.hosted_failed = None;
-        }
-        if let Some(h) = &mut self.hosted
-            && let State::Stopped(why) = h.state()
-        {
-            self.engine.log(format!("Streaming server stopped: {why}"));
-            self.hosted = None;
-            self.hosted_failed = Some((hosting, Instant::now()));
-            self.ui.hosting = crate::ui::HostingStatus::Failed(why);
-        }
-        if self.hosted.is_none() {
-            let waiting = self
-                .hosted_failed
-                .as_ref()
-                .is_some_and(|(h, at)| *h == hosting && at.elapsed() < Duration::from_secs(10));
-            if !waiting {
-                match crate::mediamtx::locate() {
-                    None => {
-                        self.ui.hosting = crate::ui::HostingStatus::Missing;
-                        self.hosted_failed = Some((hosting, Instant::now()));
-                    }
-                    Some(exe) => {
-                        let dir = crate::crash::log_dir().join("mediamtx");
-                        match Hosted::start(&exe, &dir, hosting) {
-                            Ok(h) => {
-                                self.engine.log("Streaming server started");
-                                self.hosted = Some(h);
-                                self.hosted_failed = None;
-                            }
-                            Err(e) => {
-                                self.engine.log(format!("Streaming server: {e}"));
-                                self.ui.hosting = crate::ui::HostingStatus::Failed(e);
-                                self.hosted_failed = Some((hosting, Instant::now()));
-                            }
-                        }
-                    }
-                }
+        let settled = desired.is_none() || self.hosting_seen.1.elapsed() >= Duration::from_secs(1);
+        if settled && self.hosting_sent != desired {
+            if desired.is_some() || self.hosting_runner.is_some() {
+                self.hosting_runner
+                    .get_or_insert_with(|| Runner::start(crate::crash::log_dir().join("mediamtx")))
+                    .want(desired);
             }
+            self.hosting_sent = desired;
         }
-        if let Some(h) = &self.hosted {
-            self.ui.hosting = crate::ui::HostingStatus::Running(h.hosting);
-        }
+        self.ui.hosting = match &plan {
+            None => Status::Off,
+            Some(p) if missing_adapter => Status::Failed(format!(
+                "the network adapter {} isn't connected: choose another, or Automatic",
+                p.adapter
+            )),
+            Some(_) if !allowed => Status::NotAllowed,
+            Some(_) => self
+                .hosting_runner
+                .as_ref()
+                .map_or(Status::Off, Runner::status),
+        };
+        plan
     }
 
     /// Stop every stream, without waiting for them.
     fn stop_streams(&mut self) {
-        self.hosted = None;
+        self.hosting_runner = None;
+        self.hosting_sent = None;
         for (_, running) in self.streams.drain() {
             let _ = std::thread::Builder::new()
                 .name("stream-stop".into())
@@ -1448,7 +1436,7 @@ impl App {
     /// the picture it is to send: the display's own picture on its own canvas,
     /// without the shaping a projector needs.
     fn update_streams(&mut self, groups: &HashMap<OutputId, OutputGroup>) {
-        self.update_hosting();
+        let plan = self.update_hosting();
         let Some(gpu) = self.gpu.clone() else { return };
         let wanted: HashMap<OutputId, (StreamOut, (u32, u32))> = self
             .show
@@ -1456,7 +1444,10 @@ impl App {
             .iter()
             .filter(|o| o.enabled && !o.is_sub_display() && self.show.part_of(o.id).is_none())
             .filter_map(|o| {
-                let s = o.stream.as_ref().filter(|s| s.enabled)?.clamped();
+                let mut s = o.stream.as_ref().filter(|s| s.enabled)?.clamped();
+                if let Some(p) = &plan {
+                    crate::mediamtx::align(&mut s.kind, p);
+                }
                 let size = crate::stream::size_for(self.picture_size(o.id), s.height);
                 Some((o.id, (s, size)))
             })
@@ -2789,7 +2780,7 @@ impl ApplicationHandler for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // The streaming server NewQ runs goes with it.
-        self.hosted = None;
+        self.hosting_runner = None;
         self.engine.stop_all(0.0);
         self.save_layout(true);
         if let Some(t) = self.control.as_mut().and_then(|c| c.thread.take()) {

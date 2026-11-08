@@ -420,6 +420,30 @@ fn media_page(ui: &mut Ui, show: &Show, st: &mut UiState, actions: &mut Vec<Acti
              together.",
         );
     });
+    section(ui, "Streaming server (this computer)", |ui| {
+        let mut on = st.prefs.allow_hosting;
+        if ui
+            .checkbox(
+                &mut on,
+                "Let a show run a streaming server on this computer",
+            )
+            .changed()
+        {
+            st.prefs.allow_hosting = on;
+            if let Some(dir) = &st.layout_dir
+                && let Err(e) = st.prefs.save(dir)
+            {
+                log::warn!("could not save the settings of this computer: {e}");
+            }
+        }
+        hint(
+            ui,
+            "A display's Send out can run the MediaMTX that comes with NewQ so phones and other \
+             computers can watch it. It opens network ports while the stream is on. A show that \
+             asks for it starts nothing here until this is on; ticking \"Run the server in NewQ\" \
+             turns it on.",
+        );
+    });
     section(ui, "Programs (this computer)", |ui| {
         let mut on = st.prefs.allow_scripts;
         if ui

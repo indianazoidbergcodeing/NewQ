@@ -11,6 +11,8 @@
 # Every package also bundles the MediaMTX streaming server (scripts/mediamtx_pins.txt),
 # downloaded from its own GitHub releases and checked against its SHA-256.
 set -euo pipefail
+# A failure inside $(...) must stop the script too.
+shopt -s inherit_errexit 2>/dev/null || true
 
 platform="$1"
 tag="$2"
@@ -161,6 +163,7 @@ case "$platform" in
     cp target/release/newq.exe "$stage/"
     bundle_ffmpeg "$(pinned_asset -win64-lgpl-)" ".exe"
     bundle_mediamtx "$stage/mediamtx" windows_amd64 ".exe"
+    "$stage/mediamtx/mediamtx.exe" --version
     (cd dist/stage && 7z a -tzip -bso0 "${root}/dist/${name}.zip" "$name")
     ;;
   linux-x64)

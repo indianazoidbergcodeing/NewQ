@@ -497,14 +497,31 @@ enter, and *Test Mode* downloads its free test media when you start it.
     with the stream, so there is nothing to install or set up. It serves the
     stream by RTSP, RTMP, SRT, HLS and a **web player** (WebRTC, port 8889 by
     default) that works in any phone's browser. If it can't start (a port is in
-    use) the section says why and NewQ tries again every ten seconds. Without
-    the tick, NewQ publishes to a MediaMTX you run yourself at the address you
-    give.
+    use, or two of its ports are set the same) the section says why and NewQ
+    tries again every ten seconds. Without the tick, NewQ publishes to a
+    MediaMTX you run yourself at the address you give.
+
+    Anyone on the network can watch the stream, but only this computer can send
+    one to the server, and a second sender can't take the stream over from the
+    first. The server stops when NewQ closes, when it crashes (on Windows and
+    Linux) or, failing that, at the next start of NewQ. It opens network ports,
+    so a show can't start one on a computer that hasn't been allowed: ticking
+    *Run the server in NewQ* allows it (so does *Allow this computer to run a
+    server* on that section, and *Settings → Streaming server (this computer)*
+    turns it off again). What the server said is added to `mediamtx.log` in a
+    `mediamtx` folder inside NewQ's log folder.
+
+    One server serves every display that runs its own: the first such display's
+    adapter and ports are used for all of them. A change to a port is acted on
+    once you have stopped changing it for a second.
 
     **Network adapter:** choose which of the computer's network connections
     the stream is served on (*Automatic* is all of them). A server run by NewQ
     then listens on that adapter only, and the player link and QR code carry
-    its address; a server on this computer is also reached by it. NewQ can't
+    its address; a server on this computer is also reached by it. If the adapter
+    you chose isn't there (the network is down, or the show was made on another
+    computer) the server does not start, rather than listening on every
+    adapter. NewQ can't
     make FFmpeg send from a given adapter to a server elsewhere (its RTSP, RTMP
     and SRT have no such option): to a remote server the adapter only decides
     the address in the links.

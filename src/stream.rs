@@ -495,7 +495,11 @@ impl Sink {
             {
                 return Err(why);
             }
-            let output = output_args(kind, encoder(ff), fps)?;
+            let chosen = encoder(ff);
+            if let Some(name) = chosen {
+                log::info!("stream encoder: {name}");
+            }
+            let output = output_args(kind, chosen, fps)?;
             let mut cmd = ff.command();
             cmd.args(input_args(size, fps)).args(output);
             cmd

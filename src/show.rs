@@ -617,14 +617,17 @@ pub enum StreamKind {
         /// The network connection viewers reach this stream by: its address
         /// is what the player link and its QR code carry, and the server's
         /// address when MediaMTX runs on this computer. Empty means any.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         adapter: String,
         /// The port of MediaMTX's web player (WebRTC; 8889 by default).
-        #[serde(default = "default_player_port")]
+        #[serde(
+            default = "default_player_port",
+            skip_serializing_if = "is_default_player_port"
+        )]
         player_port: u16,
         /// Run MediaMTX inside NewQ (it comes with NewQ) rather than using one
         /// that is already running: the address above is then this computer.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         host_here: bool,
     },
 }
@@ -632,6 +635,10 @@ pub enum StreamKind {
 /// MediaMTX's usual port for its WebRTC web player.
 pub fn default_player_port() -> u16 {
     8889
+}
+
+fn is_default_player_port(p: &u16) -> bool {
+    *p == default_player_port()
 }
 
 /// How a picture is published to a streaming server.
@@ -4351,6 +4358,50 @@ mod tests {
         assert_eq!(ServerProtocol::Rtsp.default_port(), 8554);
         assert_eq!(ServerProtocol::Rtmp.default_port(), 1935);
         assert_eq!(ServerProtocol::Srt.default_port(), 8890);
+    }
+
+    #[test]
+    fn a_server_stream_from_an_older_show_loads_and_defaults_are_not_written() {
+        // As 0.18.0 wrote it: none of the server-hosting fields.
+        let old = r#"{"enabled":true,"kind":{"Server":{"protocol":"Rtsp","host":"media.local",
+            "port":8554,"path":"newq","kbps":6000}},"fps":30,"height":720}"#;
+        let s: StreamOut = serde_json::from_str(old).unwrap();
+        let StreamKind::Server {
+            adapter,
+            player_port,
+            host_here,
+            ..
+        } = &s.kind
+        else {
+            panic!("not a server stream");
+        };
+        assert_eq!(
+            (adapter.as_str(), *player_port, *host_here),
+            ("", 8889, false)
+        );
+        // Written again, the new fields are left out while they hold their defaults...
+        let json = serde_json::to_string(&s).unwrap();
+        for field in ["adapter", "player_port", "host_here"] {
+            assert!(!json.contains(field), "{field} written: {json}");
+        }
+        // ...and kept once they are set.
+        let mut set = s.clone();
+        if let StreamKind::Server {
+            adapter,
+            player_port,
+            host_here,
+            ..
+        } = &mut set.kind
+        {
+            *adapter = "en0".into();
+            *player_port = 8890;
+            *host_here = true;
+        }
+        let json = serde_json::to_string(&set).unwrap();
+        for field in ["adapter", "player_port", "host_here"] {
+            assert!(json.contains(field), "{field} lost: {json}");
+        }
+        assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), set);
     }
 
     #[test]
