@@ -266,8 +266,19 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
             port,
             path,
             kbps,
+            adapter,
+            host_here,
+            ..
         } => {
-            let url = server_url(*protocol, host, *port, path)?;
+            // A server NewQ runs is on this computer, whatever the box says.
+            let host = if *host_here {
+                "127.0.0.1"
+            } else {
+                host.as_str()
+            };
+            let host =
+                crate::streamlink::publish_host(host, adapter, &crate::streamlink::adapters());
+            let url = server_url(*protocol, &host, *port, path)?;
             let Some(enc) = h264 else {
                 return Err(NO_H264.into());
             };
@@ -899,6 +910,9 @@ mod tests {
             port,
             path: "newq".into(),
             kbps: 1000,
+            adapter: String::new(),
+            player_port: crate::show::default_player_port(),
+            host_here: false,
         };
         let size = (320u32, 180u32);
         let frame = [40u8, 120, 200, 255].repeat((size.0 * size.1) as usize);

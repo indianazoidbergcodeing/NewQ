@@ -8,6 +8,8 @@
 # its SHA-256; macOS uses the build from scripts/build_ffmpeg_macos.sh found
 # in $FFMPEG_MACOS_DIR. FFMPEG_BASE_URL overrides where the pinned files are
 # fetched from (for trying a build before it is mirrored).
+# Every package also bundles the MediaMTX streaming server (scripts/mediamtx_pins.txt),
+# downloaded from its own GitHub releases and checked against its SHA-256.
 set -euo pipefail
 
 platform="$1"
@@ -22,6 +24,9 @@ ff_release="$(awk '$1 == "release" { print $2 }' "$pins")"
 ff_base="${FFMPEG_BASE_URL:-https://github.com/${GITHUB_REPOSITORY:-r2a42/NewQ}/releases/download/${ff_release}}"
 # The pinned file for a platform ("-win64-lgpl-" or "-linux64-lgpl-").
 pinned_asset() { awk -v k="$1" 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ && index($2, k) { print $2 }' "$pins"; }
+mtx_pins="$root/scripts/mediamtx_pins.txt"
+mtx_version="$(awk '$1 == "version" { print $2 }' "$mtx_pins")"
+mtx_base="${MEDIAMTX_BASE_URL:-https://github.com/bluenviron/mediamtx/releases/download/${mtx_version}}"
 rm -rf dist
 stage="dist/stage/${name}"
 mkdir -p "$stage"
@@ -112,10 +117,50 @@ EOF
   rm -rf "$tmp"
 }
 
+# Download one pinned MediaMTX build, check it, and print the folder it was
+# unpacked into (with the program and its LICENSE in it).
+fetch_mediamtx() {
+  local os_arch="$1" asset sum tmp
+  asset="$(awk -v k="mediamtx_${mtx_version}_${os_arch}" 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ && index($2, k) == 1 { print $2 }' "$mtx_pins")"
+  [ -n "$asset" ] || { echo "no pinned MediaMTX for ${os_arch}" >&2; exit 1; }
+  sum="$(awk -v a="$asset" '$2 == a { print $1 }' "$mtx_pins")"
+  tmp="$(mktemp -d)"
+  curl -fsSL -o "${tmp}/${asset}" "${mtx_base}/${asset}" || { echo "Could not download ${asset}" >&2; exit 1; }
+  if [ "$(openssl dgst -sha256 "${tmp}/${asset}" | awk '{print $NF}')" != "$sum" ]; then
+    echo "${asset} does not match its pinned SHA-256" >&2
+    exit 1
+  fi
+  case "$asset" in
+    *.zip) (cd "$tmp" && unzip -q "$asset") ;;
+    *.tar.gz) (cd "$tmp" && tar xzf "$asset") ;;
+  esac
+  echo "$tmp"
+}
+
+# Put MediaMTX (the streaming server NewQ runs for Send out) in $1, with its
+# licence and where its source is.
+bundle_mediamtx() {
+  local dest="$1" os_arch="$2" exe_suffix="$3" tmp
+  tmp="$(fetch_mediamtx "$os_arch")" || exit 1
+  mkdir -p "$dest"
+  cp "$tmp/mediamtx${exe_suffix}" "$dest/"
+  chmod +x "$dest/mediamtx${exe_suffix}"
+  cp "$tmp/LICENSE" "$dest/LICENSE.txt"
+  cat > "$dest/SOURCE.txt" <<EOF
+This is an unmodified build of MediaMTX ${mtx_version} from
+https://github.com/bluenviron/mediamtx/releases/tag/${mtx_version}
+(MIT licence, see LICENSE.txt). NewQ runs it as a separate program to serve a
+display's stream to viewers. Source code: https://github.com/bluenviron/mediamtx
+You may replace this file with any other MediaMTX build.
+EOF
+  rm -rf "$tmp"
+}
+
 case "$platform" in
   windows-x64)
     cp target/release/newq.exe "$stage/"
     bundle_ffmpeg "$(pinned_asset -win64-lgpl-)" ".exe"
+    bundle_mediamtx "$stage/mediamtx" windows_amd64 ".exe"
     (cd dist/stage && 7z a -tzip -bso0 "${root}/dist/${name}.zip" "$name")
     ;;
   linux-x64)
@@ -125,6 +170,8 @@ case "$platform" in
     cp assets/logo/png/newq-icon-256.png "$stage/newq.png"
     cp assets/linux/newq.desktop "$stage/newq.desktop"
     bundle_ffmpeg "$(pinned_asset -linux64-lgpl-)" ""
+    bundle_mediamtx "$stage/mediamtx" linux_amd64 ""
+    "$stage/mediamtx/mediamtx" --version
     tar -C dist/stage -czf "dist/${name}.tar.gz" "$name"
     ;;
   macos-universal)
@@ -152,6 +199,25 @@ link to them. Corresponding source code:
 EOF
     mkdir -p "$stage/FFmpeg"
     cp "$app/Contents/Resources/FFmpeg/"* "$stage/FFmpeg/"
+    # MediaMTX: one universal program made from the two Mac builds, next to
+    # NewQ's own executable (where NewQ looks for it).
+    mtx_x64="$(fetch_mediamtx darwin_amd64)" || exit 1
+    mtx_arm="$(fetch_mediamtx darwin_arm64)" || exit 1
+    lipo -create "$mtx_x64/mediamtx" "$mtx_arm/mediamtx" -output "$app/Contents/MacOS/mediamtx"
+    chmod +x "$app/Contents/MacOS/mediamtx"
+    "$app/Contents/MacOS/mediamtx" --version
+    mkdir -p "$app/Contents/Resources/MediaMTX" "$stage/MediaMTX"
+    cp "$mtx_arm/LICENSE" "$app/Contents/Resources/MediaMTX/LICENSE.txt"
+    cat > "$app/Contents/Resources/MediaMTX/SOURCE.txt" <<EOF
+The mediamtx program in NewQ.app/Contents/MacOS is MediaMTX ${mtx_version}: the
+two unmodified Mac builds from
+https://github.com/bluenviron/mediamtx/releases/tag/${mtx_version}
+joined into one universal program (MIT licence, see LICENSE.txt). NewQ runs it
+as a separate program to serve a display's stream to viewers.
+Source code: https://github.com/bluenviron/mediamtx
+EOF
+    cp "$app/Contents/Resources/MediaMTX/"* "$stage/MediaMTX/"
+    rm -rf "$mtx_x64" "$mtx_arm"
     cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,7 +244,7 @@ EOF
       # first, then the app (never --deep).
       ent="$root/assets/macos/entitlements.plist"
       sign=(codesign --force --timestamp --options runtime --entitlements "$ent" --sign "$MACOS_SIGN_IDENTITY")
-      "${sign[@]}" "$app/Contents/MacOS/ffmpeg" "$app/Contents/MacOS/ffprobe"
+      "${sign[@]}" "$app/Contents/MacOS/ffmpeg" "$app/Contents/MacOS/ffprobe" "$app/Contents/MacOS/mediamtx"
       "${sign[@]}" "$app"
       codesign --verify --deep --strict --verbose=2 "$app"
       if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
@@ -205,7 +271,7 @@ EOF
       fi
     else
       # Apple Silicon only runs signed code: ad-hoc sign the helpers and the app.
-      codesign --force --sign - "$app/Contents/MacOS/ffmpeg" "$app/Contents/MacOS/ffprobe"
+      codesign --force --sign - "$app/Contents/MacOS/ffmpeg" "$app/Contents/MacOS/ffprobe" "$app/Contents/MacOS/mediamtx"
       codesign --force --sign - "$app"
       codesign --verify --deep --strict "$app"
     fi

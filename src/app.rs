@@ -257,6 +257,12 @@ pub struct App {
     patterns: HashMap<OutputId, Pattern>,
     /// The displays whose picture is being sent out.
     streams: HashMap<OutputId, RunningStream>,
+    /// The streaming server NewQ itself runs for the streams that ask for it.
+    hosted: Option<crate::mediamtx::Hosted>,
+    /// What it was last asked to be and when it stopped, so a server that
+    /// can't start (a port in use) is tried again slowly, not every frame.
+    hosted_failed: Option<(crate::mediamtx::Hosting, Instant)>,
+    adapters: (Instant, Vec<crate::streamlink::Adapter>),
     /// Streams that failed to start or stopped, by display, so they are not
     /// tried again until their settings change.
     stream_failed: HashMap<OutputId, (StreamOut, (u32, u32))>,
@@ -419,6 +425,9 @@ impl App {
             last_sizes: HashMap::new(),
             patterns: HashMap::new(),
             streams: HashMap::new(),
+            hosted: None,
+            hosted_failed: None,
+            adapters: (Instant::now() - Duration::from_secs(60), Vec::new()),
             stream_failed: HashMap::new(),
             stream_seen: HashMap::new(),
             stream_retry: HashMap::new(),
@@ -1330,8 +1339,104 @@ impl App {
         self.closing.retain(|(_, h)| !h.is_finished());
     }
 
+    /// Run, restart or stop the streaming server inside NewQ, as the streams
+    /// that are on ask for. Its state is reported to the UI.
+    fn update_hosting(&mut self) {
+        use crate::mediamtx::{Hosted, Hosting, State};
+        use crate::show::StreamKind;
+        let ask = self
+            .show
+            .outputs
+            .iter()
+            .filter(|o| o.enabled)
+            .filter_map(|o| o.stream.as_ref().filter(|s| s.enabled))
+            .find_map(|s| match &s.kind {
+                StreamKind::Server {
+                    host_here: true,
+                    adapter,
+                    port,
+                    protocol,
+                    player_port,
+                    ..
+                } => Some((adapter.clone(), *protocol, *port, *player_port)),
+                _ => None,
+            });
+        let Some((adapter, protocol, port, player_port)) = ask else {
+            if self.hosted.take().is_some() {
+                self.engine.log("Streaming server stopped");
+            }
+            self.hosted_failed = None;
+            self.ui.hosting = crate::ui::HostingStatus::Off;
+            return;
+        };
+        if self.adapters.0.elapsed() > Duration::from_secs(5) {
+            self.adapters = (Instant::now(), crate::streamlink::adapters());
+        }
+        let mut hosting =
+            Hosting::standard(crate::streamlink::adapter_ip(&adapter, &self.adapters.1));
+        // The port the stream publishes to is the one the server opens.
+        let port = if port == 0 {
+            protocol.default_port()
+        } else {
+            port
+        };
+        match protocol {
+            crate::show::ServerProtocol::Rtsp => hosting.rtsp = port,
+            crate::show::ServerProtocol::Rtmp => hosting.rtmp = port,
+            crate::show::ServerProtocol::Srt => hosting.srt = port,
+        }
+        if player_port != 0 {
+            hosting.player = player_port;
+        }
+        if self.hosted.as_ref().is_some_and(|h| h.hosting != hosting) {
+            self.hosted = None;
+            self.hosted_failed = None;
+        }
+        if let Some(h) = &mut self.hosted
+            && let State::Stopped(why) = h.state()
+        {
+            self.engine.log(format!("Streaming server stopped: {why}"));
+            self.hosted = None;
+            self.hosted_failed = Some((hosting, Instant::now()));
+            self.ui.hosting = crate::ui::HostingStatus::Failed(why);
+        }
+        if self.hosted.is_none() {
+            let waiting = self
+                .hosted_failed
+                .as_ref()
+                .is_some_and(|(h, at)| *h == hosting && at.elapsed() < Duration::from_secs(10));
+            if !waiting {
+                match crate::mediamtx::locate() {
+                    None => {
+                        self.ui.hosting = crate::ui::HostingStatus::Missing;
+                        self.hosted_failed = Some((hosting, Instant::now()));
+                    }
+                    Some(exe) => {
+                        let dir = crate::crash::log_dir().join("mediamtx");
+                        match Hosted::start(&exe, &dir, hosting) {
+                            Ok(h) => {
+                                self.engine.log("Streaming server started");
+                                self.hosted = Some(h);
+                                self.hosted_failed = None;
+                            }
+                            Err(e) => {
+                                self.engine.log(format!("Streaming server: {e}"));
+                                self.ui.hosting = crate::ui::HostingStatus::Failed(e);
+                                self.hosted_failed = Some((hosting, Instant::now()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(h) = &self.hosted {
+            self.ui.hosting = crate::ui::HostingStatus::Running(h.hosting);
+        }
+    }
+
     /// Stop every stream, without waiting for them.
     fn stop_streams(&mut self) {
+        self.hosted = None;
         for (_, running) in self.streams.drain() {
             let _ = std::thread::Builder::new()
                 .name("stream-stop".into())
@@ -1343,6 +1448,7 @@ impl App {
     /// the picture it is to send: the display's own picture on its own canvas,
     /// without the shaping a projector needs.
     fn update_streams(&mut self, groups: &HashMap<OutputId, OutputGroup>) {
+        self.update_hosting();
         let Some(gpu) = self.gpu.clone() else { return };
         let wanted: HashMap<OutputId, (StreamOut, (u32, u32))> = self
             .show
