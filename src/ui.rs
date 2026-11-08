@@ -5044,6 +5044,18 @@ fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
         {
             let cell: ProbeCell = Default::default();
             ui.data_mut(|d| d.insert_temp(probe_id, cell.clone()));
+            if s.host_here && !matches!(st.hosting, HostingStatus::Running(_)) {
+                // Nothing to ask: the server NewQ runs starts with the stream.
+                *cell.lock() = Some(vec![crate::streamlink::Probe {
+                    what: "NewQ's server".into(),
+                    result: Err(if s.on {
+                        "isn't running yet: see the line above for why".into()
+                    } else {
+                        "starts when \"Send this display's picture out\" is ticked".into()
+                    }),
+                }]);
+                return;
+            }
             let (protocol, port, player_port) = (s.protocol, s.port, s.player_port);
             let host = link::publish_host(host_for_viewers, s.adapter, &list);
             let ctx = ui.ctx().clone();
