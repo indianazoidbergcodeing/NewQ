@@ -169,7 +169,11 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         ]),
         "h264_nvenc" => add(&["-preset", "p4", "-tune", "ll", "-pix_fmt", "yuv420p"]),
         "h264_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
-        "h264_amf" => add(&["-usage", "lowlatency", "-pix_fmt", "yuv420p"]),
+        // Not `lowlatency`/`ultralowlatency`: those ignore `-g` and send ONE keyframe at the
+        // start (300 frames, 1 keyframe, FFmpeg 9 on a Radeon 780M), so a viewer who joins
+        // later, or whose connection drops, never gets a picture. `webcam` is still low
+        // latency and keeps the keyframe every two seconds.
+        "h264_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
         "libopenh264" => add(&["-allow_skip_frames", "0", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
@@ -840,6 +844,10 @@ mod tests {
                 .join(" ")
                 .contains("-pix_fmt nv12")
         );
+        // AMF's low-latency usages send one keyframe and never another.
+        let amf = h264_args("h264_amf", 6000, 30).join(" ");
+        assert!(amf.contains("-usage webcam"), "{amf}");
+        assert!(!amf.contains("latency"), "{amf}");
         // A silly bitrate is held to a range.
         assert!(h264_args("libx264", 1, 30).join(" ").contains("-b:v 200k"));
         assert!(

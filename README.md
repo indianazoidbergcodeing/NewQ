@@ -489,6 +489,9 @@ enter, and *Test Mode* downloads its free test media when you start it.
     *Encoder* on that section picks one by hand (Automatic uses the first that
     works). If viewers get no picture, try *OpenH264 (software)*: a hardware
     encoder can pass NewQ's quick test and still send a stream nobody can show.
+    (AMD AMF did exactly that until its *low latency* mode was dropped: it sent one
+    keyframe and never another, so anyone who joined the stream late, or whose
+    connection dropped and came back, saw nothing.)
     The log (`newq.log`) names the encoder used.
     NewQ's Mac FFmpeg can do RTSP and RTMP but not SRT (that needs libsrt);
     whether the Windows and Linux ones have libsrt isn't checked here. A very
