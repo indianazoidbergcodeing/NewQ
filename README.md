@@ -544,8 +544,10 @@ enter, and *Test Mode* downloads its free test media when you start it.
     Checked here by publishing to FFmpeg's own RTSP and RTMP listeners and
     decoding what arrived, and by starting the real MediaMTX through NewQ,
     publishing through FFmpeg, loading the web player page and playing the
-    stream back over RTSP (Linux, libx264); **not tried on a Mac or Windows,
-    nor with a hardware encoder, nor a phone scanning the code**.
+    stream back over RTSP (Linux, libx264), and on Windows with AMD AMF through the
+    bundled MediaMTX (a viewer joining late, five viewers over RTSP, RTMP and HLS for
+    three minutes with flat memory); **not tried on a Mac, nor with NVENC or Quick Sync,
+    nor a phone scanning the code**.
   - *Custom FFmpeg output*: the arguments that follow the input (the picture
     arrives as raw RGBA), for anything else FFmpeg can send to: a streaming
     service, a file.
@@ -556,6 +558,10 @@ enter, and *Test Mode* downloads its free test media when you start it.
   until its settings are changed, except a *Streaming server* one: it starts
   again by itself after 2, 4, 8, 15 and then every 30 seconds, so a server that
   restarts or a network that drops during a show comes back without you.
+  Stopping a stream waits a few seconds for FFmpeg to say goodbye to the server and
+  then ends it (a Custom output that may be writing a file is given a minute), so a
+  server that has stopped answering can't leave an FFmpeg running, or hold up
+  the next start. On Windows every stream's FFmpeg also ends with NewQ, however NewQ ends.
 - **Sub displays:** split a display into areas that each work like a display
   of their own, e.g. one projector covering two set pieces, or one LED
   processor input feeding several screens. Add one under *Sub displays* (or

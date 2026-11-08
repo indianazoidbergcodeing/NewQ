@@ -216,7 +216,16 @@ The README describes the features; this file is about working on the code.
   test encode, once per run), and `missing_for` checks the muxer and protocol (the Mac bundle has
   no libsrt, so no SRT). The Mac FFmpeg is built with network on and the `mpegts,rtsp,rtp,flv`
   muxers for this; `package_release.sh::verify_ffmpeg` checks them. Tests publish to FFmpeg's own
-  RTSP/RTMP listeners.
+  RTSP/RTMP listeners. A hardware encoder must be checked for its keyframe spacing, not just that it
+  encodes: AMF's `lowlatency` usage sent one keyframe ever (`ffprobe -show_entries packet=flags`).
+  A stream's FFmpeg must never be waited on without a limit: `Sink::finish` kills it after
+  `finish_patience(kind)` (3 s; a Custom output gets 60 s for closing a file), `CaptureThread::stop`
+  ends it through a `Killer` when the thread is stuck writing to it (a hung server fills the pipe),
+  and on Windows it is in a kill-on-close job (`mediamtx::tie_to_us`). Linux and Mac have no
+  equivalent for a crash yet. The stress tests (`mediamtx/stress.rs`, `gpu.rs::stress_stop_…`) are
+  `#[ignore]`d; run them with `NEWQ_MEDIAMTX_DIR` and `NEWQ_FFMPEG_DIR` set and `--ignored --nocapture`.
+  sysinfo only fills `Process::cmd()` when asked (`ProcessRefreshKind::with_cmd`); without it a
+  "no FFmpeg left" check passes for the wrong reason.
   `src/mediamtx.rs`: NewQ runs MediaMTX itself (`StreamKind::Server::host_here`): `locate` (next to the
   executable, `NEWQ_MEDIAMTX_DIR`, `third_party/mediamtx`, PATH), `Hosting::config` writes its YAML (listen
   address of the chosen adapter, per-protocol ports; publishing only from loopback and the adapter, read for all,
