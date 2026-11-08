@@ -219,9 +219,16 @@ The README describes the features; this file is about working on the code.
   RTSP/RTMP listeners.
   `src/mediamtx.rs`: NewQ runs MediaMTX itself (`StreamKind::Server::host_here`): `locate` (next to the
   executable, `NEWQ_MEDIAMTX_DIR`, `third_party/mediamtx`, PATH), `Hosting::config` writes its YAML (listen
-  address of the chosen adapter, per-protocol ports), `Hosted` is the child process (killed on drop; its last
-  lines say why it stopped). `app.rs::update_hosting` runs/restarts/stops one server for all streams that ask
-  (the first one's ports win), retrying a failed start every 10 s, and reports `UiState::hosting`.
+  address of the chosen adapter, per-protocol ports; publishing only from loopback and the adapter, read for all,
+  `overridePublisher: no`), `Hosting::conflict` finds two ways in on one port, `Hosted` is the child process
+  (killed on drop; Linux `PR_SET_PDEATHSIG`, a Windows job object, so a crash leaves none; its last lines say why it
+  stopped; output appended to `<log folder>/mediamtx/mediamtx.log`). Each run has a folder named for its pid with
+  `mediamtx.yml` and `server.pid`; `stop_leftovers` kills a server whose NewQ is gone (or is us) and only if the pid
+  is still the MediaMTX exe. `Runner` is the worker thread (start/stop/retry every 10 s; status in `Status`).
+  `plan`/`align` make every display that runs its own server agree on one adapter and port set (first wins).
+  `app.rs::update_hosting` works out the plan each frame, settles a change for 1 s, refuses a missing adapter and a
+  computer without `Prefs::allow_hosting`, and sets `UiState::hosting`. Real-server tests need
+  `NEWQ_MEDIAMTX_DIR` (they pick their own ports; WebRTC's and RTSP-over-UDP's are settings for that).
   `src/streamlink.rs`: network adapters (`if-addrs`), the player/protocol links, the QR modules (`qrcode`),
   and `probe_server` (TCP connects; SRT is UDP so unchecked). The UI is `ui.rs::server_share_panel`.
   An adapter can't make FFmpeg bind its outgoing socket (RTSP/RTMP/SRT have no such option), so it picks the

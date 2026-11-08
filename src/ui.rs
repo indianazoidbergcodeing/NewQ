@@ -211,21 +211,15 @@ struct CollectJob {
 }
 
 /// How the streaming server that NewQ runs itself is doing (set by the app).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub enum HostingStatus {
-    /// No stream asks for it.
-    #[default]
-    Off,
-    Running(crate::mediamtx::Hosting),
-    /// The program isn't with this copy of NewQ.
-    Missing,
-    Failed(String),
-}
+pub use crate::mediamtx::Status as HostingStatus;
 
 #[derive(Default)]
 pub struct UiState {
     /// The streaming server NewQ runs for "Run the server in NewQ".
     pub hosting: HostingStatus,
+    /// Set by ticking "Run the server in NewQ" (or its Allow button): this
+    /// computer is to be allowed to run a server for a show. The app saves it.
+    pub hosting_allow_request: std::cell::Cell<bool>,
     pub selected: Option<CueId>,
     pub show_path: Option<PathBuf>,
     pub monitors: Vec<MonitorInfo>,
@@ -4758,11 +4752,18 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                             ui.end_row();
                             ui.label("Server");
                             ui.vertical(|ui| {
-                                ui.checkbox(host_here, "Run the server in NewQ")
+                                if ui
+                                    .checkbox(host_here, "Run the server in NewQ")
                                     .on_hover_text(
                                         "NewQ starts the MediaMTX that comes with it and stops \
                                          it with the stream: nothing else to install or run",
-                                    );
+                                    )
+                                    .changed()
+                                    && *host_here
+                                {
+                                    // Ticking it here is allowing it on this computer.
+                                    st.hosting_allow_request.set(true);
+                                }
                                 if !*host_here {
                                     ui.horizontal(|ui| {
                                         ui.add(
@@ -4981,6 +4982,11 @@ fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
                     .to_string(),
                 true,
             ),
+            HostingStatus::NotAllowed => (
+                "⚠ This computer hasn't been allowed to run a streaming server for a show."
+                    .to_string(),
+                true,
+            ),
             HostingStatus::Failed(why) => (format!("⚠ The server stopped: {why}"), true),
         };
         let text = RichText::new(text).small();
@@ -4989,11 +4995,46 @@ fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
         } else {
             text.weak()
         });
+        if st.hosting == HostingStatus::NotAllowed
+            && ui.button("Allow this computer to run a server").clicked()
+        {
+            st.hosting_allow_request.set(true);
+        }
     }
     let (lan, list) = cached_adapters(ui);
+    // One server serves every display that runs its own: when it is running,
+    // its address and ports are the ones to give out, whatever this display says.
+    let running = match (&st.hosting, s.host_here) {
+        (HostingStatus::Running(h), true) => Some(*h),
+        _ => None,
+    };
+    let port = running.map_or(s.port, |h| h.port_of(s.protocol));
+    let player_port = running.map_or(s.player_port, |h| h.player);
+    if let Some(h) = running
+        && (port != s.port
+            || player_port != s.player_port
+            || h.listen
+                .is_some_and(|ip| link::adapter_ip(s.adapter, &list) != Some(ip)))
+    {
+        ui.label(
+            RichText::new(
+                "Another display runs the server: it is used as it is, with that display's \
+                 adapter and ports.",
+            )
+            .weak()
+            .small(),
+        );
+    }
     // Where a viewer's device finds the server, and where NewQ itself sends to.
     let host_for_viewers = if s.host_here { "127.0.0.1" } else { s.host };
-    let Some(vh) = link::viewer_host(host_for_viewers, s.adapter, &list, lan) else {
+    let viewer = match running {
+        Some(h) => h
+            .listen
+            .map(|ip| ip.to_string())
+            .or_else(|| lan.map(|ip| ip.to_string())),
+        None => link::viewer_host(host_for_viewers, s.adapter, &list, lan),
+    };
+    let Some(vh) = viewer else {
         ui.label(
             RichText::new(
                 "⚠ No network address a phone could reach: connect to a network, or choose a \
@@ -5004,12 +5045,8 @@ fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
         );
         return;
     };
-    let viewer_port = if s.host_here || s.port != 0 {
-        s.port
-    } else {
-        0
-    };
-    let player = link::player_url(&vh, s.player_port, s.path);
+    let viewer_port = if s.host_here || port != 0 { port } else { 0 };
+    let player = link::player_url(&vh, player_port, s.path);
     let direct = link::stream_link(s.protocol, &vh, viewer_port, s.path);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -5056,8 +5093,11 @@ fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
                 }]);
                 return;
             }
-            let (protocol, port, player_port) = (s.protocol, s.port, s.player_port);
-            let host = link::publish_host(host_for_viewers, s.adapter, &list);
+            let protocol = s.protocol;
+            let host = match running.and_then(|h| h.listen) {
+                Some(ip) => ip.to_string(),
+                None => link::publish_host(host_for_viewers, s.adapter, &list),
+            };
             let ctx = ui.ctx().clone();
             std::thread::Builder::new()
                 .name("stream-probe".into())

@@ -17,6 +17,11 @@ pub struct Prefs {
     /// since a show can come from anywhere.
     #[serde(default)]
     pub allow_scripts: bool,
+    /// Let a show start a streaming server on this computer (a display's Send
+    /// out set to run the server in NewQ). Turned on by ticking that box here;
+    /// a show opened from somewhere else can't start one before that.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_hosting: bool,
     /// The monitors Test Mode shows its tests on (each by its make and model, or
     /// the name the system gives it); none = the displays of the show.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -86,6 +91,7 @@ mod tests {
             hw_decode: true,
             show_mode: true,
             allow_scripts: true,
+            allow_hosting: true,
             test_displays: vec!["Dell U2720Q".into()],
             test_sound: Some("USB Interface".into()),
             test_muted: true,
