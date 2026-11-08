@@ -10,3 +10,5 @@
 # Autosave copies written beside shows
 *.newq.recovery*
 *.newq.tmp
+
+# Local MediaMTX for development: scripts fetch the pinned build, see scripts/mediamtx_pins.txt
