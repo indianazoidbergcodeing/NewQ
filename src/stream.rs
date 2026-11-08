@@ -173,8 +173,11 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "libopenh264" => add(&["-allow_skip_frames", "0", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
+    // No B-frames: they reorder frames, which a browser's WebRTC player
+    // (MediaMTX's web player) can't show, and some hardware encoders use them
+    // unless told not to.
     add(&[
-        "-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf, "-g", &gop,
+        "-bf", "0", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf, "-g", &gop,
     ]);
     a
 }

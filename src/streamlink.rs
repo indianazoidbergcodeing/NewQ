@@ -154,7 +154,17 @@ pub fn tcp_probe(host: &str, port: u16, timeout: Duration) -> Result<Duration, S
     for a in addrs {
         match TcpStream::connect_timeout(&a, timeout) {
             Ok(_) => return Ok(started.elapsed()),
-            Err(e) => last = format!("{a}: {e}"),
+            Err(e) => {
+                last = match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => {
+                        format!("nothing is listening on {a} (is the server running?)")
+                    }
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        format!("no answer from {a} (wrong address, or a firewall)")
+                    }
+                    _ => format!("{a}: {e}"),
+                }
+            }
         }
     }
     Err(last)
@@ -174,7 +184,8 @@ pub fn probe_server(
     port: u16,
     player_port: u16,
 ) -> Vec<Probe> {
-    let timeout = Duration::from_millis(1500);
+    // (Windows takes about two seconds to give up on a closed port.)
+    let timeout = Duration::from_millis(3500);
     let mut out = Vec::new();
     let port = if port == 0 {
         protocol.default_port()

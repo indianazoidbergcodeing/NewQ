@@ -5,12 +5,11 @@
 //! stops it when it is no longer wanted or NewQ quits.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -50,6 +49,34 @@ pub fn locate() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Stop a server left running by an earlier NewQ that was killed or crashed: it
+/// would still hold the ports, and the new server could not start. Only a
+/// program started with this very configuration file is stopped, so a MediaMTX
+/// of anyone's own is left alone.
+fn stop_leftovers(conf: &Path) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let mut stopped = false;
+    for p in sys.processes().values() {
+        let ours = p.cmd().iter().any(|a| Path::new(a) == conf);
+        if ours && p.pid().as_u32() != std::process::id() && p.kill() {
+            log::info!(
+                "stopped a MediaMTX left running by an earlier NewQ (pid {})",
+                p.pid()
+            );
+            stopped = true;
+        }
+    }
+    if stopped {
+        // Let the system free its ports.
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// What the hosted server is asked to do: which address to listen on and the
 /// port of each way in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +90,11 @@ pub struct Hosting {
     pub player: u16,
     /// The same picture as HLS, for browsers that can't do WebRTC.
     pub hls: u16,
+    /// Where WebRTC's media travels (UDP, and TCP as a fallback).
+    pub ice: u16,
+    /// The UDP port RTSP viewers can receive media on (RTCP uses the next one).
+    /// 0 turns UDP off: RTSP then runs over TCP only.
+    pub rtp: u16,
 }
 
 impl Hosting {
@@ -75,6 +107,8 @@ impl Hosting {
             srt: 8890,
             player: crate::show::default_player_port(),
             hls: 8888,
+            ice: 8189,
+            rtp: 8000,
         }
     }
 
@@ -93,6 +127,15 @@ impl Hosting {
             Some(ip) => format!("webrtcIPsFromInterfaces: no\nwebrtcAdditionalHosts: [\"{ip}\"]\n"),
             None => String::new(),
         };
+        let rtsp_transports = if self.rtp == 0 {
+            "rtspTransports: [tcp]\n".to_string()
+        } else {
+            format!(
+                "rtspTransports: [udp, tcp]\nrtpAddress: {}\nrtcpAddress: {}\n",
+                at(self.rtp),
+                at(self.rtp + 1)
+            )
+        };
         format!(
             "# Written by NewQ each time it starts the server: changes here are lost.\n\
              logLevel: info\n\
@@ -100,6 +143,8 @@ impl Hosting {
              metrics: no\n\
              pprof: no\n\
              playback: no\n\
+             moq: no\n\
+             {rtsp_transports}\
              rtspAddress: {rtsp}\n\
              rtspsAddress: \"\"\n\
              rtmpAddress: {rtmp}\n\
@@ -108,7 +153,7 @@ impl Hosting {
              hlsAddress: {hls}\n\
              webrtcAddress: {player}\n\
              webrtcLocalUDPAddress: {udp}\n\
-             webrtcLocalTCPAddress: \"\"\n\
+             webrtcLocalTCPAddress: {udp}\n\
              {webrtc_hosts}\
              paths:\n  all_others:\n",
             rtsp = at(self.rtsp),
@@ -116,7 +161,7 @@ impl Hosting {
             srt = at(self.srt),
             hls = at(self.hls),
             player = at(self.player),
-            udp = at(8189),
+            udp = at(self.ice),
         )
     }
 }
@@ -142,7 +187,11 @@ impl Hosted {
     pub fn start(exe: &Path, dir: &Path, hosting: Hosting) -> Result<Hosted, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let conf = dir.join("mediamtx.yml");
+        stop_leftovers(&conf);
         std::fs::write(&conf, hosting.config()).map_err(|e| format!("{}: {e}", conf.display()))?;
+        // What the server says is kept in a file, for finding out why a
+        // viewer sees nothing.
+        let log = std::fs::File::create(dir.join("mediamtx.log")).ok();
         let mut cmd = Command::new(exe);
         cmd.arg(&conf)
             // It leaves a certificate it makes in its working folder.
@@ -161,10 +210,14 @@ impl Hosted {
         ];
         for pipe in pipes.into_iter().flatten() {
             let tail = tail.clone();
+            let log = log.as_ref().and_then(|f| f.try_clone().ok());
             std::thread::Builder::new()
                 .name("mediamtx-log".into())
                 .spawn(move || {
                     for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        if let Some(f) = &log {
+                            let _ = writeln!(&*f, "{line}");
+                        }
                         let mut t = tail.lock();
                         if t.len() >= 12 {
                             t.pop_front();
@@ -214,12 +267,19 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
 
+    /// A port free for TCP and UDP (WebRTC uses both), never given out twice:
+    /// tests run in parallel, and a port freed again is free for the next caller.
     fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        static GIVEN: parking_lot::Mutex<Vec<u16>> = parking_lot::Mutex::new(Vec::new());
+        let mut given = GIVEN.lock();
+        loop {
+            let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = tcp.local_addr().unwrap().port();
+            if !given.contains(&port) && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                given.push(port);
+                return port;
+            }
+        }
     }
 
     #[test]
@@ -269,6 +329,8 @@ mod tests {
             srt: free_port(),
             player: free_port(),
             hls: free_port(),
+            ice: free_port(),
+            rtp: 0,
         };
         let mut server = Hosted::start(&exe, &dir, hosting).expect("start");
         let up = (0..50).any(|_| {
@@ -300,6 +362,44 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A server left running by a NewQ that was killed doesn't stop the next
+    /// one from starting.
+    #[test]
+    fn a_server_left_behind_is_stopped_before_the_next_starts() {
+        let Some(exe) = locate() else {
+            eprintln!("no MediaMTX here: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("newq-mtx-left-{}", std::process::id()));
+        let hosting = Hosting {
+            listen: Some(Ipv4Addr::LOCALHOST.into()),
+            rtsp: free_port(),
+            rtmp: free_port(),
+            srt: free_port(),
+            player: free_port(),
+            hls: free_port(),
+            ice: free_port(),
+            rtp: 0,
+        };
+        let first = Hosted::start(&exe, &dir, hosting).expect("start");
+        assert!((0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::streamlink::tcp_probe("127.0.0.1", hosting.rtsp, Duration::from_millis(200))
+                .is_ok()
+        }));
+        // NewQ dying leaves the program running, which forgetting the handle imitates.
+        std::mem::forget(first);
+        let mut second = Hosted::start(&exe, &dir, hosting).expect("start");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            second.state(),
+            State::Running,
+            "the second server could not start"
+        );
+        drop(second);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The whole chain with the real programs: NewQ runs MediaMTX, publishes a
     /// picture to it through FFmpeg, the web player page answers, and the
     /// picture can be read back over RTSP.
@@ -325,6 +425,8 @@ mod tests {
             srt: free_port(),
             player: free_port(),
             hls: free_port(),
+            ice: free_port(),
+            rtp: 0,
         };
         let mut server = Hosted::start(&exe, &dir, hosting).expect("start");
         assert!((0..50).any(|_| {

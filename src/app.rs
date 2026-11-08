@@ -2788,6 +2788,8 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The streaming server NewQ runs goes with it.
+        self.hosted = None;
         self.engine.stop_all(0.0);
         self.save_layout(true);
         if let Some(t) = self.control.as_mut().and_then(|c| c.thread.take()) {
