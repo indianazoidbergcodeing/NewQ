@@ -380,6 +380,11 @@ pub struct CaptureThread {
     mailbox: Arc<Mailbox<CaptureJob>>,
     errors: crossbeam_channel::Receiver<String>,
     handle: JoinHandle<()>,
+    /// Ends the stream's FFmpeg if the thread is stuck writing to it when asked to stop.
+    killer: Arc<parking_lot::Mutex<Option<crate::stream::Killer>>>,
+    /// How long `stop` waits before it ends FFmpeg: a little longer than the
+    /// time `Sink::finish` gives it, which a stop that is going well can use.
+    patience: std::time::Duration,
 }
 
 impl CaptureThread {
@@ -408,13 +413,19 @@ impl CaptureThread {
         let mailbox = Arc::new(Mailbox::new());
         let mb = mailbox.clone();
         let (err_tx, errors) = crossbeam_channel::unbounded();
+        let patience = crate::stream::finish_patience(&kind) + std::time::Duration::from_secs(2);
+        let killer: Arc<parking_lot::Mutex<Option<crate::stream::Killer>>> = Arc::default();
+        let kill_slot = killer.clone();
         let handle = std::thread::Builder::new()
             .name("stream-render".into())
             .spawn(move || {
                 // Started here: asking FFmpeg what it can encode and starting it
                 // can take a while.
                 match crate::stream::Sink::start(&ff, size, fps, &kind) {
-                    Ok(sink) => capture_loop(gpu, slot, size, fps, slow, sink, mb, err_tx),
+                    Ok(sink) => {
+                        *kill_slot.lock() = Some(sink.killer());
+                        capture_loop(gpu, slot, size, fps, slow, sink, mb, err_tx)
+                    }
                     Err(e) => {
                         let _ = err_tx.send(e);
                     }
@@ -425,6 +436,8 @@ impl CaptureThread {
             mailbox,
             errors,
             handle,
+            killer,
+            patience,
         }
     }
 
@@ -446,9 +459,30 @@ impl CaptureThread {
         !self.handle.is_finished()
     }
 
-    /// Stop, letting FFmpeg finish what it has been given, and wait.
+    /// Stop, letting FFmpeg finish what it has been given, and wait. A thread that
+    /// does not stop (FFmpeg has stalled and the thread is stuck writing to it) has
+    /// its FFmpeg killed after its patience, which fails the write; one that still
+    /// does not stop after that is left behind rather than waited for.
     pub fn stop(self) {
         self.mailbox.put(CaptureJob::Quit, |_, quit| quit);
+        let patience = self.patience;
+        let wait = |limit: std::time::Duration| {
+            let end = std::time::Instant::now() + limit;
+            while !self.handle.is_finished() && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            self.handle.is_finished()
+        };
+        if !wait(patience) {
+            log::warn!("the stream did not stop in {patience:?}: ending its FFmpeg");
+            if let Some(k) = self.killer.lock().as_ref() {
+                k.kill();
+            }
+            if !wait(patience) {
+                log::warn!("the stream's thread is still stuck: leaving it");
+                return;
+            }
+        }
         let _ = self.handle.join();
     }
 }

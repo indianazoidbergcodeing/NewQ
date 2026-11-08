@@ -504,6 +504,48 @@ pub struct Sink {
     stdin: Option<ChildStdin>,
     /// What FFmpeg has said on its error output.
     said: Arc<parking_lot::Mutex<String>>,
+    /// Ends FFmpeg with NewQ, however NewQ ends (a crash left them running).
+    #[cfg(windows)]
+    _job: Option<crate::mediamtx::JobGuard>,
+    /// How long `finish` waits before killing FFmpeg (`finish_patience`).
+    patience: std::time::Duration,
+}
+
+/// How long `Sink::finish` lets FFmpeg wind up (flush the encoder, say goodbye to
+/// the server) before it is killed. A server that has stopped answering would
+/// otherwise hold it, and the thread that waits for it, for good.
+pub const FINISH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long `kind`'s FFmpeg may take to finish. A Custom output may be writing a file
+/// (closing an mp4 can take a while), so it is given much longer than a live stream.
+pub fn finish_patience(kind: &StreamKind) -> std::time::Duration {
+    match kind {
+        StreamKind::Custom { .. } => std::time::Duration::from_secs(60),
+        _ => FINISH_PATIENCE,
+    }
+}
+
+/// A way to end a `Sink`'s FFmpeg from another thread while the thread that owns the
+/// sink is stuck in a write to it: the write then fails and the owner gives up.
+#[derive(Clone, Debug)]
+pub struct Killer {
+    pid: u32,
+    started: u64,
+}
+
+impl Killer {
+    /// End the process, if it is still the one this was made for (a process
+    /// number can be given to another program once the first has ended).
+    pub fn kill(&self) -> bool {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(self.pid);
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        match sys.process(pid) {
+            Some(p) if p.start_time() == self.started => p.kill(),
+            _ => false,
+        }
+    }
 }
 
 impl Sink {
@@ -573,7 +615,28 @@ impl Sink {
                     }
                 });
         }
-        Ok(Sink { child, stdin, said })
+        #[cfg(windows)]
+        let _job = crate::mediamtx::tie_to_us(&child);
+        Ok(Sink {
+            child,
+            stdin,
+            said,
+            #[cfg(windows)]
+            _job,
+            patience: finish_patience(kind),
+        })
+    }
+
+    /// A handle that can end this FFmpeg from another thread.
+    pub fn killer(&self) -> Killer {
+        use sysinfo::{Pid, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(self.child.id());
+        let mut sys = System::new();
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        Killer {
+            pid: self.child.id(),
+            started: sys.process(pid).map_or(0, |p| p.start_time()),
+        }
     }
 
     /// Send one frame (`size.0 * size.1 * 4` bytes of RGBA). An error says why
@@ -608,9 +671,20 @@ impl Sink {
         }
     }
 
-    /// Close the input so FFmpeg finishes what it has, and wait for it.
+    /// Close the input so FFmpeg finishes what it has, and wait for it, but only
+    /// for `finish_patience`: then it is killed.
     pub fn finish(mut self) {
         self.stdin = None;
+        let patience = self.patience;
+        let deadline = std::time::Instant::now() + patience;
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() >= deadline {
+                log::warn!("FFmpeg did not finish in {patience:?}: ending it");
+                let _ = self.child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = self.child.wait();
     }
 }
@@ -843,6 +917,12 @@ mod tests {
             h264_args("h264_qsv", 6000, 30)
                 .join(" ")
                 .contains("-pix_fmt nv12")
+        );
+        // A file being closed is given time; a live stream's FFmpeg is not waited on for long.
+        assert!(
+            finish_patience(&StreamKind::Custom {
+                args: "out.mp4".into()
+            }) > finish_patience(&StreamKind::server(ServerProtocol::Rtsp))
         );
         // AMF's low-latency usages send one keyframe and never another.
         let amf = h264_args("h264_amf", 6000, 30).join(" ");

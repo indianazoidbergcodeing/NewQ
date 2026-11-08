@@ -288,7 +288,7 @@ pub enum Status {
 }
 
 #[cfg(windows)]
-struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 unsafe impl Send for JobGuard {}
@@ -304,7 +304,7 @@ impl Drop for JobGuard {
 /// Put `child` in a job that is ended when NewQ's handle on it closes, which
 /// happens when NewQ exits however it does, so a crash leaves no server.
 #[cfg(windows)]
-fn tie_to_us(child: &Child) -> Option<JobGuard> {
+pub(crate) fn tie_to_us(child: &Child) -> Option<JobGuard> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -638,6 +638,9 @@ fn work(rx: Receiver<Option<Hosting>>, status: Arc<Mutex<Status>>, root: PathBuf
         }
     }
 }
+
+#[cfg(test)]
+mod stress;
 
 #[cfg(test)]
 mod tests {

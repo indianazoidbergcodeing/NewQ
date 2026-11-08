@@ -2306,6 +2306,79 @@ mod tests {
         );
     }
 
+    /// Stress: a server that accepts the connection and never answers (a hung
+    /// MediaMTX, a firewall that drops replies). How long does Stop take, and is any
+    /// FFmpeg left? Run on purpose: `cargo test --release stress_stop -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stress_stop_while_the_server_never_answers() {
+        use crate::media::ffmpeg::Ffmpeg;
+        use crate::render::CaptureThread;
+        use crate::show::{ServerProtocol, StreamKind};
+        let Some(gpu) = test_gpu() else { return };
+        let Some(ff) = Ffmpeg::locate() else { return };
+        let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = hole.local_addr().unwrap().port();
+        let held = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let h2 = held.clone();
+        std::thread::spawn(move || {
+            for s in hole.incoming().flatten() {
+                h2.lock().push(s); // keep it open, say nothing
+            }
+        });
+        let tag = format!("hole{}", std::process::id());
+        let mut kind = StreamKind::server(ServerProtocol::Rtsp);
+        if let StreamKind::Server {
+            port: p,
+            path,
+            encoder,
+            ..
+        } = &mut kind
+        {
+            *p = port;
+            *path = tag.clone();
+            *encoder = std::env::var("NEWQ_STRESS_ENCODER").unwrap_or_default();
+        }
+        let size = (1920u32, 1080u32);
+        let thread = CaptureThread::spawn(gpu, Slot::Capture(1), size, 30, ff, kind);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        eprintln!(
+            "after 4 s: running={} failure={:?}",
+            thread.is_running(),
+            thread.failure()
+        );
+        let t = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            thread.stop();
+            let _ = tx.send(());
+        });
+        let stopped = rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok();
+        eprintln!("stop() returned: {stopped} after {:?}", t.elapsed());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let left: Vec<u32> = sys
+            .processes()
+            .values()
+            .filter(|p| p.cmd().iter().any(|a| a.to_string_lossy().contains(&tag)))
+            .map(|p| p.pid().as_u32())
+            .collect();
+        eprintln!("ffmpeg left behind: {left:?}");
+        for pid in &left {
+            if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
+                p.kill();
+            }
+        }
+        assert!(stopped, "Stop never returned: the main loop would hang");
+        assert!(t.elapsed().as_secs() < 10, "Stop took {:?}", t.elapsed());
+        assert!(left.is_empty());
+    }
+
     /// A picture of `size` square: black on the left half, white on the right.
     fn half_and_half(size: u32) -> Vec<u8> {
         let mut pixels = Vec::new();
