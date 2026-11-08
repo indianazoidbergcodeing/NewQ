@@ -12,7 +12,9 @@ sha="${1:?usage: check_main_ci.sh <sha>}"
 doc_only='\.md$|^LICENSE-'
 
 passed() {
-  [ "$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$1&status=success&per_page=1" --jq '.total_count')" -ge 1 ]
+  # Look at each run's own result: the API's `status=success` filter has been
+  # seen to leave out a finished, successful run (so a release was refused).
+  [ "$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$1&per_page=30" --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | length')" -ge 1 ]
 }
 
 if passed "$sha"; then
