@@ -40,6 +40,8 @@ winit = "0.30.13"
 zip = { version = "9.2.2", default-features = false, features = ["deflate"] }
 roxmltree = "0.21.2"
 hayro = "0.8"
+qrcode = { version = "0.14", default-features = false }
+if-addrs = "0.15"
 
 # Same versions as winit's, to ask a Mac for each display's name.
 [target.'cfg(target_os = "macos")'.dependencies]

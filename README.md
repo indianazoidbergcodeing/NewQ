@@ -25,7 +25,7 @@ includes FFmpeg, so there's nothing else to install.
   to [SignPath Foundation](https://signpath.org) for free code signing for
   open source projects; this section will name them once a certificate is issued.
 - **What is signed:** only `newq.exe` and the Mac app, which are built from this
-  repository's source. Third-party programs bundled in the download (FFmpeg) are
+  repository's source. Third-party programs bundled in the download (FFmpeg and MediaMTX) are
   separate open source programs and are not signed by us.
 - **How:** every release is built by the GitHub Actions workflow in
   [`.github/workflows/release.yml`](.github/workflows/release.yml) from a tagged
@@ -489,9 +489,39 @@ enter, and *Test Mode* downloads its free test media when you start it.
     NewQ's Mac FFmpeg can do RTSP and RTMP but not SRT (that needs libsrt);
     whether the Windows and Linux ones have libsrt isn't checked here. A very
     wide picture is sent at most 4096 wide. No password for the server (use a
-    Custom output for one). Checked here by publishing to
-    FFmpeg's own RTSP and RTMP listeners and decoding what arrived; **not
-    tried against a real MediaMTX, nor on a Mac, nor with a hardware encoder**.
+    Custom output for one).
+
+    **The server comes with NewQ.** Tick *Run the server in NewQ* and NewQ
+    starts the MediaMTX in its download (a `mediamtx` program next to NewQ;
+    `NEWQ_MEDIAMTX_DIR` points elsewhere) when the stream is on, and stops it
+    with the stream, so there is nothing to install or set up. It serves the
+    stream by RTSP, RTMP, SRT, HLS and a **web player** (WebRTC, port 8889 by
+    default) that works in any phone's browser. If it can't start (a port is in
+    use) the section says why and NewQ tries again every ten seconds. Without
+    the tick, NewQ publishes to a MediaMTX you run yourself at the address you
+    give.
+
+    **Network adapter:** choose which of the computer's network connections
+    the stream is served on (*Automatic* is all of them). A server run by NewQ
+    then listens on that adapter only, and the player link and QR code carry
+    its address; a server on this computer is also reached by it. NewQ can't
+    make FFmpeg send from a given adapter to a server elsewhere (its RTSP, RTMP
+    and SRT have no such option): to a remote server the adapter only decides
+    the address in the links.
+
+    **Player link and QR code:** the section shows the link to the web player
+    (`http://address:8889/name`) and to the protocol itself (`rtsp://…`), each
+    with a *Copy* button, and *Show QR code* draws the player link as a QR code
+    that a phone's camera opens, so nobody types the address. If the server is
+    on this computer and no adapter is chosen the link uses the computer's
+    address on the local network. *Test server* tries the server's ports
+    (SRT is UDP and can't be tried) and says which answered.
+
+    Checked here by publishing to FFmpeg's own RTSP and RTMP listeners and
+    decoding what arrived, and by starting the real MediaMTX through NewQ,
+    publishing through FFmpeg, loading the web player page and playing the
+    stream back over RTSP (Linux, libx264); **not tried on a Mac or Windows,
+    nor with a hardware encoder, nor a phone scanning the code**.
   - *Custom FFmpeg output*: the arguments that follow the input (the picture
     arrives as raw RGBA), for anything else FFmpeg can send to: a streaming
     service, a file.

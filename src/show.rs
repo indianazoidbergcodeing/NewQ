@@ -614,7 +614,24 @@ pub enum StreamKind {
         path: String,
         /// The video bitrate, in kilobits a second.
         kbps: u32,
+        /// The network connection viewers reach this stream by: its address
+        /// is what the player link and its QR code carry, and the server's
+        /// address when MediaMTX runs on this computer. Empty means any.
+        #[serde(default)]
+        adapter: String,
+        /// The port of MediaMTX's web player (WebRTC; 8889 by default).
+        #[serde(default = "default_player_port")]
+        player_port: u16,
+        /// Run MediaMTX inside NewQ (it comes with NewQ) rather than using one
+        /// that is already running: the address above is then this computer.
+        #[serde(default)]
+        host_here: bool,
     },
+}
+
+/// MediaMTX's usual port for its WebRTC web player.
+pub fn default_player_port() -> u16 {
+    8889
 }
 
 /// How a picture is published to a streaming server.
@@ -656,6 +673,9 @@ impl StreamKind {
             port: protocol.default_port(),
             path: "newq".into(),
             kbps: 6000,
+            adapter: String::new(),
+            player_port: default_player_port(),
+            host_here: false,
         }
     }
 }
@@ -4317,6 +4337,9 @@ mod tests {
                 port: 0,
                 path: "live/show".into(),
                 kbps: 4500,
+                adapter: "en0".into(),
+                player_port: 8890,
+                host_here: true,
             },
             fps: 30,
             height: 1080,

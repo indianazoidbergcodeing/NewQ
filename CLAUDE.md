@@ -216,7 +216,19 @@ The README describes the features; this file is about working on the code.
   test encode, once per run), and `missing_for` checks the muxer and protocol (the Mac bundle has
   no libsrt, so no SRT). The Mac FFmpeg is built with network on and the `mpegts,rtsp,rtp,flv`
   muxers for this; `package_release.sh::verify_ffmpeg` checks them. Tests publish to FFmpeg's own
-  RTSP/RTMP listeners; a real MediaMTX wasn't available here.
+  RTSP/RTMP listeners.
+  `src/mediamtx.rs`: NewQ runs MediaMTX itself (`StreamKind::Server::host_here`): `locate` (next to the
+  executable, `NEWQ_MEDIAMTX_DIR`, `third_party/mediamtx`, PATH), `Hosting::config` writes its YAML (listen
+  address of the chosen adapter, per-protocol ports), `Hosted` is the child process (killed on drop; its last
+  lines say why it stopped). `app.rs::update_hosting` runs/restarts/stops one server for all streams that ask
+  (the first one's ports win), retrying a failed start every 10 s, and reports `UiState::hosting`.
+  `src/streamlink.rs`: network adapters (`if-addrs`), the player/protocol links, the QR modules (`qrcode`),
+  and `probe_server` (TCP connects; SRT is UDP so unchecked). The UI is `ui.rs::server_share_panel`.
+  An adapter can't make FFmpeg bind its outgoing socket (RTSP/RTMP/SRT have no such option), so it picks the
+  listen address, the publish address for a local server, and the address in the links. Tests: the real
+  server and a real publish/play-back run when `NEWQ_MEDIAMTX_DIR` (or PATH) has `mediamtx`, else skip.
+  `scripts/mediamtx_pins.txt` pins the bundled version and SHA-256s; `package_release.sh::bundle_mediamtx`
+  fetches it from MediaMTX's GitHub releases (a universal `lipo` binary on the Mac, signed with the others).
   `src/pattern.rs`: the twelve test patterns (`show::PatternKind`), drawn on the
   CPU; `app.rs` caches one per display by kind, number and size.
   `src/live_text.rs`: clock and speaker timer text (the engine redraws the

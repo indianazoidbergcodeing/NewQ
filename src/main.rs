@@ -26,6 +26,7 @@ mod live_text;
 #[cfg(target_os = "macos")]
 mod macwin;
 mod media;
+mod mediamtx;
 mod mesh;
 mod monitor;
 mod ndi;
@@ -47,6 +48,7 @@ mod speed;
 mod splash;
 mod stats;
 mod stream;
+mod streamlink;
 mod testmode;
 mod text;
 mod timecode;

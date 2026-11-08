@@ -210,8 +210,22 @@ struct CollectJob {
     dest: PathBuf,
 }
 
+/// How the streaming server that NewQ runs itself is doing (set by the app).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum HostingStatus {
+    /// No stream asks for it.
+    #[default]
+    Off,
+    Running(crate::mediamtx::Hosting),
+    /// The program isn't with this copy of NewQ.
+    Missing,
+    Failed(String),
+}
+
 #[derive(Default)]
 pub struct UiState {
+    /// The streaming server NewQ runs for "Run the server in NewQ".
+    pub hosting: HostingStatus,
     pub selected: Option<CueId>,
     pub show_path: Option<PathBuf>,
     pub monitors: Vec<MonitorInfo>,
@@ -4503,7 +4517,7 @@ fn displays_panel(
             );
             corner_pin_editor(ui, d, st, actions);
             edge_blend_editor(ui, d, state_size.unwrap_or((1920, 1080)));
-            stream_editor(ui, d, engine);
+            stream_editor(ui, d, engine, st);
         });
     }
 }
@@ -4629,7 +4643,7 @@ fn shared_picture_editor(
 
 /// Sending a display's picture out as video: to a virtual camera (Linux), to
 /// OBS over the network, or anywhere FFmpeg can send it.
-fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine) {
+fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &UiState) {
     use crate::show::{ServerProtocol, StreamKind, StreamOut};
     let on = d.stream.as_ref().is_some_and(|s| s.enabled);
     egui::CollapsingHeader::new(if on { "Send out ●" } else { "Send out" })
@@ -4723,6 +4737,9 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine) {
                             port,
                             path,
                             kbps,
+                            adapter,
+                            player_port,
+                            host_here,
                         } => {
                             ui.label("Protocol");
                             ui.horizontal(|ui| {
@@ -4740,14 +4757,68 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine) {
                             });
                             ui.end_row();
                             ui.label("Server");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(host).desired_width(120.0));
-                                ui.label(":");
-                                ui.add(egui::DragValue::new(port).range(1..=65535).speed(1.0));
+                            ui.vertical(|ui| {
+                                ui.checkbox(host_here, "Run the server in NewQ")
+                                    .on_hover_text(
+                                        "NewQ starts the MediaMTX that comes with it and stops \
+                                         it with the stream: nothing else to install or run",
+                                    );
+                                if !*host_here {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(host).desired_width(120.0),
+                                        );
+                                        ui.label(":");
+                                        ui.add(
+                                            egui::DragValue::new(port).range(1..=65535).speed(1.0),
+                                        );
+                                    });
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Port");
+                                        ui.add(
+                                            egui::DragValue::new(port).range(1..=65535).speed(1.0),
+                                        );
+                                    });
+                                }
                             });
+                            ui.end_row();
+                            ui.label("Network adapter");
+                            let list = cached_adapters(ui).1;
+                            let shown = match crate::streamlink::adapter_ip(adapter, &list) {
+                                _ if adapter.trim().is_empty() => "Automatic (all)".to_string(),
+                                Some(ip) => format!("{adapter} ({ip})"),
+                                None => format!("{adapter} (not connected)"),
+                            };
+                            egui::ComboBox::from_id_salt(("stream_adapter", d.id.0))
+                                .selected_text(shown)
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(adapter, String::new(), "Automatic (all)");
+                                    for a in &list {
+                                        ui.selectable_value(adapter, a.name.clone(), a.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "The network connection viewers reach the stream by. With the \
+                                     server in NewQ it only listens there; the player link and QR \
+                                     code carry this adapter's address",
+                                );
                             ui.end_row();
                             ui.label("Stream name");
                             ui.add(egui::TextEdit::singleline(path).desired_width(120.0));
+                            ui.end_row();
+                            ui.label("Web player port");
+                            ui.add(
+                                egui::DragValue::new(player_port)
+                                    .range(1..=65535)
+                                    .speed(1.0),
+                            )
+                            .on_hover_text(
+                                "Where MediaMTX serves its web player (8889 by default): \
+                                     the page the QR code opens",
+                            );
                             ui.end_row();
                             ui.label("Bitrate");
                             ui.add(
@@ -4820,10 +4891,231 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine) {
                 .weak()
                 .small(),
             );
+            if let StreamKind::Server {
+                protocol,
+                host,
+                port,
+                path,
+                adapter,
+                player_port,
+                host_here,
+                ..
+            } = &s.kind
+            {
+                server_share_panel(
+                    ui,
+                    d.id.0,
+                    st,
+                    ServerShare {
+                        protocol: *protocol,
+                        host,
+                        port: *port,
+                        path,
+                        adapter,
+                        player_port: *player_port,
+                        host_here: *host_here,
+                        on: s.enabled,
+                    },
+                );
+            }
         });
     // A section that was opened and left alone isn't saved.
     if d.stream.as_ref() == Some(&StreamOut::default()) {
         d.stream = None;
+    }
+}
+
+/// This computer's network adapters and its address on the local network,
+/// looked up at most every few seconds (the lookup is a system call).
+fn cached_adapters(ui: &Ui) -> (Option<std::net::IpAddr>, Vec<crate::streamlink::Adapter>) {
+    type Cache = (
+        f64,
+        Option<std::net::IpAddr>,
+        Vec<crate::streamlink::Adapter>,
+    );
+    let id = egui::Id::new("newq_adapters");
+    let now = ui.input(|i| i.time);
+    if let Some((at, lan, list)) = ui.data(|d| d.get_temp::<Cache>(id))
+        && now - at < 4.0
+    {
+        return (lan, list);
+    }
+    let list = crate::streamlink::adapters();
+    let lan = crate::web::lan_address();
+    ui.data_mut(|d| d.insert_temp::<Cache>(id, (now, lan, list.clone())));
+    (lan, list)
+}
+
+/// What the share panel needs to know about a streaming-server stream.
+struct ServerShare<'a> {
+    protocol: crate::show::ServerProtocol,
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+    adapter: &'a str,
+    player_port: u16,
+    host_here: bool,
+    on: bool,
+}
+
+type ProbeCell = std::sync::Arc<parking_lot::Mutex<Option<Vec<crate::streamlink::Probe>>>>;
+
+/// For a streaming-server stream: how the server NewQ runs is doing, the links
+/// viewers use, a QR code for the web player (so a phone needs no typing), and
+/// a check that the server answers.
+fn server_share_panel(ui: &mut Ui, id: u64, st: &UiState, s: ServerShare) {
+    use crate::streamlink as link;
+    if s.host_here {
+        let (text, bad) = match &st.hosting {
+            HostingStatus::Off => ("Server: starts when the stream is on".to_string(), false),
+            HostingStatus::Running(h) => (
+                match h.listen {
+                    Some(ip) => format!("Server running in NewQ, listening on {ip}"),
+                    None => "Server running in NewQ, listening on every adapter".to_string(),
+                },
+                false,
+            ),
+            HostingStatus::Missing => (
+                "⚠ MediaMTX isn't with this copy of NewQ. Put the mediamtx program next to \
+                 NewQ (or in a mediamtx folder there, or set NEWQ_MEDIAMTX_DIR)."
+                    .to_string(),
+                true,
+            ),
+            HostingStatus::Failed(why) => (format!("⚠ The server stopped: {why}"), true),
+        };
+        let text = RichText::new(text).small();
+        ui.label(if bad {
+            text.color(ui.visuals().warn_fg_color)
+        } else {
+            text.weak()
+        });
+    }
+    let (lan, list) = cached_adapters(ui);
+    // Where a viewer's device finds the server, and where NewQ itself sends to.
+    let host_for_viewers = if s.host_here { "127.0.0.1" } else { s.host };
+    let Some(vh) = link::viewer_host(host_for_viewers, s.adapter, &list, lan) else {
+        ui.label(
+            RichText::new(
+                "⚠ No network address a phone could reach: connect to a network, or choose a \
+                 network adapter.",
+            )
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+        return;
+    };
+    let viewer_port = if s.host_here || s.port != 0 {
+        s.port
+    } else {
+        0
+    };
+    let player = link::player_url(&vh, s.player_port, s.path);
+    let direct = link::stream_link(s.protocol, &vh, viewer_port, s.path);
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Player link");
+        ui.add(egui::Label::new(RichText::new(&player).monospace()).selectable(true));
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(player.clone());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(format!("{} link", s.protocol.label()));
+        ui.add(egui::Label::new(RichText::new(&direct).monospace()).selectable(true));
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(direct.clone());
+        }
+    });
+    let open_id = egui::Id::new(("stream_qr", id));
+    let mut show_qr = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(&mut show_qr, "Show QR code")
+            .on_hover_text("A phone's camera opens the player link from it: no typing")
+            .changed()
+        {
+            ui.data_mut(|d| d.insert_temp(open_id, show_qr));
+        }
+        let probe_id = egui::Id::new(("stream_probe", id));
+        if ui
+            .button("Test server")
+            .on_hover_text("Checks that the server answers on its ports")
+            .clicked()
+        {
+            let cell: ProbeCell = Default::default();
+            ui.data_mut(|d| d.insert_temp(probe_id, cell.clone()));
+            let (protocol, port, player_port) = (s.protocol, s.port, s.player_port);
+            let host = link::publish_host(host_for_viewers, s.adapter, &list);
+            let ctx = ui.ctx().clone();
+            std::thread::Builder::new()
+                .name("stream-probe".into())
+                .spawn(move || {
+                    let r = link::probe_server(protocol, &host, port, player_port);
+                    *cell.lock() = Some(r);
+                    ctx.request_repaint();
+                })
+                .ok();
+        }
+    });
+    if show_qr {
+        draw_qr(ui, &player);
+        ui.label(RichText::new(format!("Opens {player}")).weak().small());
+    }
+    if let Some(cell) = ui.data(|d| d.get_temp::<ProbeCell>(egui::Id::new(("stream_probe", id)))) {
+        match &*cell.lock() {
+            None => {
+                ui.label(RichText::new("Checking…").weak().small());
+            }
+            Some(results) => {
+                for p in results {
+                    let (mark, text) = match &p.result {
+                        Ok(t) => ("✔", format!("{}: answered in {} ms", p.what, t.as_millis())),
+                        Err(e) => ("✖", format!("{}: {e}", p.what)),
+                    };
+                    let line = RichText::new(format!("{mark} {text}")).small();
+                    ui.label(if p.result.is_err() {
+                        line.color(ui.visuals().warn_fg_color)
+                    } else {
+                        line
+                    });
+                }
+                if s.on && results.iter().any(|p| p.result.is_err()) && !s.host_here {
+                    ui.label(
+                        RichText::new("Is the server running? Tick \"Run the server in NewQ\" to have NewQ run it.")
+                            .weak()
+                            .small(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Draw `text` as a QR code on a white square (a dark code on white is what
+/// phones read, whatever the theme), with the quiet zone round it.
+fn draw_qr(ui: &mut Ui, text: &str) {
+    let Some((n, dark)) = crate::streamlink::qr_modules(text) else {
+        ui.label(RichText::new("⚠ Too long for a QR code").small());
+        return;
+    };
+    let quiet = 3usize;
+    let total = (n + 2 * quiet) as f32;
+    let cell = (200.0 / total).floor().max(2.0);
+    let side = cell * total;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, Color32::WHITE);
+    for y in 0..n {
+        for x in 0..n {
+            if dark[y * n + x] {
+                let min = rect.min + egui::vec2((x + quiet) as f32, (y + quiet) as f32) * cell;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(min, egui::vec2(cell, cell)),
+                    0.0,
+                    Color32::BLACK,
+                );
+            }
+        }
     }
 }
 
