@@ -486,6 +486,10 @@ enter, and *Test Mode* downloads its free test media when you start it.
     (VideoToolbox on a Mac, then NVENC, Quick Sync, AMF) or OpenH264, found by
     trying each; if none works the status bar says so, and a computer with
     none of them needs a Custom output or an FFmpeg with libx264 (`NEWQ_FFMPEG_DIR`).
+    *Encoder* on that section picks one by hand (Automatic uses the first that
+    works). If viewers get no picture, try *OpenH264 (software)*: a hardware
+    encoder can pass NewQ's quick test and still send a stream nobody can show.
+    The log (`newq.log`) names the encoder used.
     NewQ's Mac FFmpeg can do RTSP and RTMP but not SRT (that needs libsrt);
     whether the Windows and Linux ones have libsrt isn't checked here. A very
     wide picture is sent at most 4096 wide. No password for the server (use a

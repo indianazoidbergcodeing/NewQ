@@ -397,6 +397,41 @@ pub fn encoder(ff: &Ffmpeg) -> Option<&'static str> {
     Some(FOUND.get_or_init(|| e))
 }
 
+/// The H.264 encoder the user asked for by FFmpeg's name, if this FFmpeg has
+/// it. It is not test-encoded: a hardware encoder that isn't there says so
+/// itself when the stream starts.
+pub fn encoder_named(ff: &Ffmpeg, wanted: &str) -> Result<&'static str, String> {
+    let wanted = wanted.trim();
+    let Some(known) = H264_ENCODERS.into_iter().find(|e| *e == wanted) else {
+        return Err(format!("{wanted} is not an H.264 encoder NewQ knows"));
+    };
+    if lists(&caps(ff).encoders, known) {
+        Ok(known)
+    } else {
+        Err(format!(
+            "this FFmpeg has no {known} encoder: choose another"
+        ))
+    }
+}
+
+/// What each H.264 encoder is, as a person would say it.
+pub fn encoder_label(name: &str) -> &'static str {
+    match name {
+        "libx264" => "x264 (software)",
+        "h264_videotoolbox" => "Apple VideoToolbox (hardware)",
+        "h264_nvenc" => "NVIDIA NVENC (hardware)",
+        "h264_qsv" => "Intel Quick Sync (hardware)",
+        "h264_amf" => "AMD AMF (hardware)",
+        "libopenh264" => "OpenH264 (software)",
+        _ => "",
+    }
+}
+
+/// The names `encoder_named` accepts, best first.
+pub fn encoder_names() -> [&'static str; 6] {
+    H264_ENCODERS
+}
+
 /// Why `ff` can't publish `protocol`, if it can't.
 fn missing_for(ff: &Ffmpeg, protocol: ServerProtocol) -> Option<String> {
     let c = caps(ff);
@@ -495,7 +530,14 @@ impl Sink {
             {
                 return Err(why);
             }
-            let chosen = encoder(ff);
+            // An encoder the user chose is used as it is; otherwise the first
+            // that works.
+            let chosen = match kind {
+                StreamKind::Server {
+                    encoder: wanted, ..
+                } if !wanted.trim().is_empty() => Some(encoder_named(ff, wanted)?),
+                _ => encoder(ff),
+            };
             if let Some(name) = chosen {
                 log::info!("stream encoder: {name}");
             }
@@ -920,6 +962,7 @@ mod tests {
             adapter: String::new(),
             player_port: crate::show::default_player_port(),
             host_here: false,
+            encoder: String::new(),
         };
         let size = (320u32, 180u32);
         let frame = [40u8, 120, 200, 255].repeat((size.0 * size.1) as usize);
@@ -975,6 +1018,46 @@ mod tests {
             String::from_utf8_lossy(&probe.stderr)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_encoder_is_used_as_named_and_a_wrong_name_is_an_error() {
+        for name in encoder_names() {
+            assert!(!encoder_label(name).is_empty(), "{name} has no label");
+        }
+        let Some(ff) = Ffmpeg::locate() else {
+            if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+                panic!("NEWQ_REQUIRE_MEDIA is set but ffmpeg was not found");
+            }
+            return;
+        };
+        let why = encoder_named(&ff, "not_an_encoder").unwrap_err();
+        assert!(why.contains("not an H.264 encoder NewQ knows"), "{why}");
+        // One this FFmpeg lists is returned as named, with no test encode.
+        if let Some(listed) = encoder_names()
+            .into_iter()
+            .find(|n| lists(&caps(&ff).encoders, n))
+        {
+            assert_eq!(encoder_named(&ff, &format!(" {listed} ")), Ok(listed));
+        }
+        // One it doesn't list says so, naming it.
+        if let Some(missing) = encoder_names()
+            .into_iter()
+            .find(|n| !lists(&caps(&ff).encoders, n))
+        {
+            let why = encoder_named(&ff, missing).unwrap_err();
+            assert!(
+                why.contains(missing) && why.contains("choose another"),
+                "{why}"
+            );
+        }
+        // The choice reaches the arguments FFmpeg is given.
+        let mut kind = StreamKind::server(ServerProtocol::Rtsp);
+        if let StreamKind::Server { encoder, .. } = &mut kind {
+            *encoder = "libopenh264".into();
+        }
+        let args = output_args(&kind, Some("libopenh264"), 30).unwrap();
+        assert_eq!(&args[..2], ["-c:v", "libopenh264"]);
     }
 
     #[test]

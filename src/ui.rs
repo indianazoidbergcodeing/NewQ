@@ -4734,6 +4734,7 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                             adapter,
                             player_port,
                             host_here,
+                            encoder,
                         } => {
                             ui.label("Protocol");
                             ui.horizontal(|ui| {
@@ -4828,6 +4829,36 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                                     .speed(50.0)
                                     .suffix(" kbps"),
                             );
+                            ui.end_row();
+                            ui.label("Encoder");
+                            let shown = if encoder.is_empty() {
+                                "Automatic".to_string()
+                            } else {
+                                format!("{} ({encoder})", crate::stream::encoder_label(encoder))
+                            };
+                            egui::ComboBox::from_id_salt(("stream_encoder", d.id.0))
+                                .selected_text(shown)
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(encoder, String::new(), "Automatic");
+                                    for name in crate::stream::encoder_names() {
+                                        ui.selectable_value(
+                                            encoder,
+                                            name.to_string(),
+                                            format!(
+                                                "{} ({name})",
+                                                crate::stream::encoder_label(name)
+                                            ),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Automatic uses the first encoder that works on this \
+                                     computer. If viewers see no picture, try OpenH264 \
+                                     (software): it works everywhere, with more load on the \
+                                     processor. The log says which one was used.",
+                                );
                             ui.end_row();
                         }
                         StreamKind::Custom { args } => {
