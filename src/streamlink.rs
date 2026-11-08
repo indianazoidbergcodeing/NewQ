@@ -142,6 +142,10 @@ pub struct Probe {
 /// Open a TCP connection to `host:port` and close it again.
 pub fn tcp_probe(host: &str, port: u16, timeout: Duration) -> Result<Duration, String> {
     let started = Instant::now();
+    // (Windows resolves an empty name to this computer, which then answers.)
+    if bracket_less(host).is_empty() {
+        return Err("no address for the streaming server".into());
+    }
     let addrs: Vec<SocketAddr> = (bracket_less(host), port)
         .to_socket_addrs()
         .map_err(|e| format!("can't find {host}: {e}"))?
