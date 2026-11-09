@@ -186,6 +186,76 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
     a
 }
 
+/// H.265 encoders to try, best first, as for `H264_ENCODERS`.
+const HEVC_ENCODERS: [&str; 5] = [
+    "libx265",
+    "hevc_videotoolbox",
+    "hevc_nvenc",
+    "hevc_qsv",
+    "hevc_amf",
+];
+
+/// The arguments that make H.265 with `encoder` at about `kbps`, for a file
+/// (so, unlike `h264_args`, nothing is tuned for latency).
+pub fn hevc_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    let kbps = kbps.clamp(200, 200_000);
+    let rate = format!("{kbps}k");
+    let buf = format!("{}k", kbps * 2);
+    let gop = (fps.max(1) * 2).to_string();
+    let mut a: Vec<String> = ["-c:v", encoder].map(String::from).to_vec();
+    let mut add = |more: &[&str]| a.extend(more.iter().map(|s| s.to_string()));
+    match encoder {
+        "libx265" => add(&["-preset", "veryfast", "-pix_fmt", "yuv420p"]),
+        "hevc_videotoolbox" => add(&["-pix_fmt", "yuv420p"]),
+        "hevc_nvenc" => add(&["-preset", "p4", "-pix_fmt", "yuv420p"]),
+        "hevc_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
+        "hevc_amf" => add(&["-usage", "transcoding", "-pix_fmt", "yuv420p"]),
+        _ => add(&["-pix_fmt", "yuv420p"]),
+    }
+    // `hvc1` is the tag QuickTime and Apple's players need to open H.265.
+    add(&[
+        "-tag:v", "hvc1", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf, "-g", &gop,
+    ]);
+    a
+}
+
+/// Where a recording is written: the folder (Downloads if empty), and a name
+/// from the day and time it started.
+pub fn record_path(
+    folder: &str,
+    container: crate::show::RecordContainer,
+    started: &jiff::Zoned,
+) -> std::path::PathBuf {
+    let folder = folder.trim();
+    let dir = if folder.is_empty() {
+        default_record_folder()
+    } else {
+        std::path::PathBuf::from(folder)
+    };
+    dir.join(format!(
+        "NewQ {}.{}",
+        started.strftime("%Y-%m-%d %H.%M.%S"),
+        container.extension()
+    ))
+}
+
+/// The Downloads folder of whoever is using this computer.
+pub fn default_record_folder() -> std::path::PathBuf {
+    crate::relink::home_dir()
+        .map(|h| h.join("Downloads"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// FFmpeg's `-vf crop` for `area` of the picture, with even sides (encoders
+/// want that) worked out from the picture's own size.
+pub fn crop_filter(area: crate::show::RecordArea) -> String {
+    let a = area.clamped();
+    format!(
+        "crop=trunc(iw*{:.4}/2)*2:trunc(ih*{:.4}/2)*2:trunc(iw*{:.4}/2)*2:trunc(ih*{:.4}/2)*2",
+        a.w, a.h, a.x, a.y
+    )
+}
+
 /// Where a server stream goes, as the URL FFmpeg publishes to.
 pub fn server_url(
     protocol: ServerProtocol,
@@ -299,6 +369,37 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
             Ok(a)
         }
         StreamKind::Ndi { .. } => Err("an NDI source is sent by NewQ itself, not FFmpeg".into()),
+        StreamKind::Record {
+            folder,
+            codec,
+            container,
+            kbps,
+            area,
+        } => {
+            // `encoder` is the one for the codec (see `Sink::start`).
+            let Some(enc) = h264 else {
+                return Err(match codec {
+                    crate::show::RecordCodec::H264 => NO_H264,
+                    crate::show::RecordCodec::H265 => NO_HEVC,
+                }
+                .into());
+            };
+            let mut a = Vec::new();
+            if let Some(area) = area {
+                a.extend(list(&["-vf", &crop_filter(*area)]));
+            }
+            match codec {
+                crate::show::RecordCodec::H264 => {
+                    // A file is not a live stream: B-frames and a slower
+                    // preset are fine, and the 2 s keyframes help seeking.
+                    a.extend(h264_args(enc, *kbps, fps));
+                }
+                crate::show::RecordCodec::H265 => a.extend(hevc_args(enc, *kbps, fps)),
+            }
+            let path = record_path(folder, *container, &jiff::Zoned::now());
+            a.push(path.to_string_lossy().into_owned());
+            Ok(a)
+        }
         StreamKind::DeckLink { device, size } => {
             let device = device.trim();
             if device.is_empty() {
@@ -335,6 +436,10 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
 const NO_H264: &str = "This computer's FFmpeg has no H.264 encoder that works here (libx264, or \
     VideoToolbox, NVENC, Quick Sync or AMF with its hardware): use a Custom FFmpeg output or \
     install an FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
+
+const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, or \r
+    VideoToolbox, NVENC, Quick Sync or AMF with its hardware): record as H.264, or install an FFmpeg \r
+    with libx265 and point NEWQ_FFMPEG_DIR at it";
 
 /// What this FFmpeg can do, asked once: its encoders, muxers and protocols.
 struct Caps {
@@ -378,7 +483,11 @@ fn encoder_works(ff: &Ffmpeg, encoder: &str) -> bool {
     let mut cmd = ff.command();
     cmd.args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30"])
         .args(["-frames:v", "8"])
-        .args(h264_args(encoder, 1000, 30))
+        .args(if HEVC_ENCODERS.contains(&encoder) {
+            hevc_args(encoder, 1000, 30)
+        } else {
+            h264_args(encoder, 1000, 30)
+        })
         .args(["-f", "null", "-"]);
     // Nothing is read from it, and a driver that hangs must not hang a stream.
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -420,6 +529,19 @@ pub fn encoder(ff: &Ffmpeg) -> Option<&'static str> {
     }
     let c = caps(ff);
     let e = pick_encoder(|e| lists(&c.encoders, e), |e| encoder_works(ff, e))?;
+    Some(FOUND.get_or_init(|| e))
+}
+
+/// The H.265 encoder to use with `ff`, if there is one that works (as `encoder`).
+pub fn hevc_encoder(ff: &Ffmpeg) -> Option<&'static str> {
+    static FOUND: OnceLock<&'static str> = OnceLock::new();
+    if let Some(e) = FOUND.get() {
+        return Some(e);
+    }
+    let c = caps(ff);
+    let e = HEVC_ENCODERS
+        .into_iter()
+        .find(|e| lists(&c.encoders, e) && encoder_works(ff, e))?;
     Some(FOUND.get_or_init(|| e))
 }
 
@@ -542,7 +664,9 @@ pub const FINISH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(
 /// (closing an mp4 can take a while), so it is given much longer than a live stream.
 pub fn finish_patience(kind: &StreamKind) -> std::time::Duration {
     match kind {
-        StreamKind::Custom { .. } => std::time::Duration::from_secs(60),
+        StreamKind::Custom { .. } | StreamKind::Record { .. } => {
+            std::time::Duration::from_secs(60)
+        }
         _ => FINISH_PATIENCE,
     }
 }
@@ -609,10 +733,21 @@ impl Sink {
                 StreamKind::Server {
                     encoder: wanted, ..
                 } if !wanted.trim().is_empty() => Some(encoder_named(ff, wanted)?),
+                StreamKind::Record {
+                    codec: crate::show::RecordCodec::H265,
+                    ..
+                } => hevc_encoder(ff),
                 _ => encoder(ff),
             };
             if let Some(name) = chosen {
                 log::info!("stream encoder: {name}");
+            }
+            if let StreamKind::Record { folder, container, .. } = kind {
+                let dir = record_path(folder, *container, &jiff::Zoned::now());
+                if let Some(dir) = dir.parent() {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| format!("could not make the folder {}: {e}", dir.display()))?;
+                }
             }
             let output = output_args(kind, chosen, fps)?;
             let mut cmd = ff.command();
@@ -797,6 +932,124 @@ mod tests {
         assert!(output_args(&k("Mini Monitor", "0x1080"), None, 30).is_err());
     }
 
+
+    #[test]
+    fn a_recording_has_its_codec_area_and_a_dated_file() {
+        use crate::show::{RecordArea, RecordCodec, RecordContainer};
+        let kind = |codec, container, area| StreamKind::Record {
+            folder: "C:/Rec".into(),
+            codec,
+            container,
+            kbps: 8000,
+            area,
+        };
+        let a = output_args(
+            &kind(RecordCodec::H264, RecordContainer::Mkv, None),
+            Some("libx264"),
+            30,
+        )
+        .unwrap();
+        assert!(!a.contains(&"-vf".to_string()));
+        assert!(a.join(" ").contains("-c:v libx264"));
+        let file = a.last().unwrap();
+        assert!(file.replace('\\', "/").starts_with("C:/Rec/NewQ 20") && file.ends_with(".mkv"), "{file}");
+        let b = output_args(
+            &kind(
+                RecordCodec::H265,
+                RecordContainer::Mov,
+                Some(RecordArea {
+                    x: 0.25,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 1.0,
+                }),
+            ),
+            Some("libx265"),
+            30,
+        )
+        .unwrap();
+        let line = b.join(" ");
+        assert!(line.contains("-c:v libx265") && line.contains("-tag:v hvc1"), "{line}");
+        assert!(
+            line.contains("-vf crop=trunc(iw*0.5000/2)*2:trunc(ih*1.0000/2)*2:trunc(iw*0.2500/2)*2:trunc(ih*0.0000/2)*2"),
+            "{line}"
+        );
+        assert!(b.last().unwrap().ends_with(".mov"));
+        // No encoder of the codec: it says which.
+        let none = output_args(&kind(RecordCodec::H265, RecordContainer::Mov, None), None, 30);
+        assert!(none.unwrap_err().contains("H.265"));
+        // An area is kept inside the picture.
+        let wild = RecordArea { x: 0.9, y: -1.0, w: 5.0, h: 0.0 }.clamped();
+        assert!(wild.x + wild.w <= 1.0 && wild.y == 0.0 && wild.h >= 0.01);
+        // Closing a file takes time, so a recording is given as long as a Custom output.
+        assert_eq!(
+            finish_patience(&kind(RecordCodec::H264, RecordContainer::Mov, None)),
+            finish_patience(&StreamKind::Custom { args: "x".into() })
+        );
+    }
+
+    #[test]
+    fn a_recording_with_no_folder_goes_to_downloads() {
+        let at: jiff::Zoned = "2026-11-09T14:05:09-05:00[America/New_York]".parse().unwrap();
+        let p = record_path("", crate::show::RecordContainer::Mp4, &at);
+        assert_eq!(p.file_name().unwrap(), "NewQ 2026-11-09 14.05.09.mp4");
+        assert!(p.parent().unwrap().ends_with("Downloads") || p.parent().unwrap() == std::path::Path::new("."));
+    }
+
+    /// Record a second of frames for real, in each codec this computer can
+    /// encode, and ask ffprobe what came out.
+    #[test]
+    fn a_recording_is_a_playable_file_of_the_size_asked() {
+        use crate::show::{RecordArea, RecordCodec, RecordContainer};
+        let Some(ff) = Ffmpeg::locate() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("newq_test_record_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (codec, container, area) in [
+            (RecordCodec::H264, RecordContainer::Mkv, None),
+            (
+                RecordCodec::H264,
+                RecordContainer::Mov,
+                Some(RecordArea { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }),
+            ),
+            (RecordCodec::H265, RecordContainer::Mp4, None),
+        ] {
+            let have = match codec {
+                RecordCodec::H264 => encoder(&ff),
+                RecordCodec::H265 => hevc_encoder(&ff),
+            };
+            if have.is_none() {
+                eprintln!("no {} encoder here; skipping", codec.label());
+                continue;
+            }
+            let sub = dir.join(format!("{codec:?}{container:?}"));
+            let kind = StreamKind::Record {
+                folder: sub.to_string_lossy().into_owned(),
+                codec,
+                container,
+                kbps: 4000,
+                area,
+            };
+            let mut sink = Sink::start(&ff, (640, 360), 30, &kind).expect("start");
+            let frame = vec![128u8; 640 * 360 * 4];
+            for _ in 0..45 {
+                sink.write(&frame).expect("write");
+            }
+            sink.finish();
+            let file = std::fs::read_dir(&sub).unwrap().next().expect("a file").unwrap().path();
+            let mut probe = ff.command();
+            probe.args(["-loglevel", "info", "-i"]).arg(&file).args(["-f", "null", "-"]);
+            let out = probe.output().unwrap();
+            assert!(out.status.success(), "{file:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let text = String::from_utf8_lossy(&out.stderr);
+            let want = if area.is_some() { "320x180" } else { "640x360" };
+            assert!(text.contains(want) && !text.contains("rror"), "{file:?} should be {want}: {text}");
+            let size = std::fs::metadata(&file).unwrap().len();
+            assert!(size > 1000, "{file:?} is {size} bytes");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn each_destination_has_the_arguments_it_needs() {
         let udp = StreamKind::Udp {

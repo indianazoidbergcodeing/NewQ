@@ -264,7 +264,7 @@ The README describes the features; this file is about working on the code.
   per system), the device's modes (`list_modes`, run on a thread by `Engine::query_camera_modes`; parsers for
   dshow, v4l2, avfoundation and decklink output, tested on sample text only) and Blackmagic `decklink:` devices
   (listed only when the FFmpeg in use has the `decklink` input: NewQ's bundled one can't, the SDK terms stop us
-  shipping one; `CameraCue::mode_code` is the `-format_code`). None of it has met a real capture card. A display's Send out can also go to a Blackmagic device (`StreamKind::DeckLink`: `-pix_fmt uyvy422 [-s WxH] -f decklink <device>`, devices from `camera::list_decklink_outputs`; same FFmpeg-build limit, also untried on hardware). `src/media/waveform.rs`: peaks for the
+  shipping one; `CameraCue::mode_code` is the `-format_code`). None of it has met a real capture card. A display's Send out can also go to a Blackmagic device (`StreamKind::DeckLink`: `-pix_fmt uyvy422 [-s WxH] -f decklink <device>`, devices from `camera::list_decklink_outputs`; same FFmpeg-build limit, also untried on hardware). A display's Send out can record to a file (`StreamKind::Record`: `record_path`, `crop_filter`, `hevc_args`; H.265 encoder found by `hevc_encoder`; closing the file gets the Custom-sized `finish_patience`). `src/media/waveform.rs`: peaks for the
   inspector's waveform.
   The `NewQ test pattern` device stands in for a camera in tests.
 

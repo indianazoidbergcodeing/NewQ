@@ -603,6 +603,27 @@ pub enum StreamKind {
     Custom { args: String },
     /// An NDI source of this name on the network (needs NDI's runtime).
     Ndi { name: String },
+    /// A recording to a file on this computer. The picture's size is the
+    /// stream's height setting; `area` keeps only part of it.
+    Record {
+        /// Where the file goes; empty is the Downloads folder. The file is named
+        /// by the day and time the recording started.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        folder: String,
+        #[serde(default)]
+        codec: RecordCodec,
+        #[serde(default)]
+        container: RecordContainer,
+        /// The video bitrate, in kilobits a second.
+        #[serde(
+            default = "default_record_kbps",
+            skip_serializing_if = "is_default_record_kbps"
+        )]
+        kbps: u32,
+        /// None records the whole picture.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<RecordArea>,
+    },
     /// A Blackmagic output (an UltraStudio Express Monitor or Mini Monitor, a
     /// DeckLink card): SDI or HDMI, not a display of the computer. FFmpeg
     /// reaches it with its `decklink` output, which only some builds have.
@@ -644,6 +665,98 @@ pub enum StreamKind {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         encoder: String,
     },
+}
+
+/// The video codec of a recording.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordCodec {
+    #[default]
+    H264,
+    H265,
+}
+
+impl RecordCodec {
+    pub const ALL: [RecordCodec; 2] = [Self::H264, Self::H265];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::H265 => "H.265 (HEVC)",
+        }
+    }
+}
+
+/// The file a recording is written to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordContainer {
+    #[default]
+    Mov,
+    /// Survives NewQ or the computer stopping mid-recording better than the others.
+    Mkv,
+    Mp4,
+}
+
+impl RecordContainer {
+    pub const ALL: [RecordContainer; 3] = [Self::Mov, Self::Mkv, Self::Mp4];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mov => "MOV",
+            Self::Mkv => "MKV",
+            Self::Mp4 => "MP4",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mov => "mov",
+            Self::Mkv => "mkv",
+            Self::Mp4 => "mp4",
+        }
+    }
+}
+
+/// The part of a display's picture that is recorded, as fractions of the
+/// picture from its top left corner (0 to 1).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordArea {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Default for RecordArea {
+    fn default() -> Self {
+        RecordArea {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        }
+    }
+}
+
+impl RecordArea {
+    /// The same kept inside the picture and at least 1% across.
+    pub fn clamped(self) -> RecordArea {
+        let x = self.x.clamp(0.0, 0.99);
+        let y = self.y.clamp(0.0, 0.99);
+        RecordArea {
+            x,
+            y,
+            w: self.w.clamp(0.01, 1.0 - x),
+            h: self.h.clamp(0.01, 1.0 - y),
+        }
+    }
+}
+
+fn default_record_kbps() -> u32 {
+    16_000
+}
+
+fn is_default_record_kbps(k: &u32) -> bool {
+    *k == default_record_kbps()
 }
 
 /// MediaMTX's usual port for its WebRTC web player.
