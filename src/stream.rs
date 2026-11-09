@@ -239,6 +239,58 @@ pub fn record_path(
     ))
 }
 
+/// `h264_args` for a file: the same encoder settings without what a live viewer
+/// needs (zero-latency tuning, no B-frames), which cost a recording quality.
+pub fn record_h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    let mut a = h264_args(encoder, kbps, fps);
+    for (key, value) in [("-tune", None), ("-bf", Some("0")), ("-realtime", None)] {
+        while let Some(at) = a.iter().position(|x| x == key) {
+            // A flag with a value, unless it only goes when the value is `value`.
+            if value.is_some_and(|v| a.get(at + 1).map(String::as_str) != Some(v)) {
+                break;
+            }
+            a.drain(at..(at + 2).min(a.len()));
+        }
+    }
+    a
+}
+
+/// Make the file a recording is written to: in its folder (made if it isn't
+/// there), named by the time it started, with ` (2)`, ` (3)` after it if that
+/// name is taken, so two recordings that start together keep to their own files.
+/// The empty file is left for FFmpeg to write over.
+pub fn reserve_record_file(
+    folder: &str,
+    container: crate::show::RecordContainer,
+) -> Result<std::path::PathBuf, String> {
+    let first = record_path(folder, container, &jiff::Zoned::now());
+    if let Some(dir) = first.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not make the folder {}: {e}", dir.display()))?;
+    }
+    for n in 1..100 {
+        let path = if n == 1 {
+            first.clone()
+        } else {
+            first.with_file_name(format!(
+                "{} ({n}).{}",
+                first.file_stem().unwrap_or_default().to_string_lossy(),
+                container.extension()
+            ))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not make {}: {e}", path.display())),
+        }
+    }
+    Err("too many recordings with the same name".into())
+}
+
 /// The Downloads folder of whoever is using this computer.
 pub fn default_record_folder() -> std::path::PathBuf {
     crate::relink::home_dir()
@@ -305,7 +357,19 @@ pub fn server_url(
 /// FFmpeg's output arguments for `kind`, for a picture at `fps`. `h264` is the
 /// H.264 encoder this FFmpeg has and that works on this computer (`encoder`),
 /// which the network and server streams use.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Vec<String>, String> {
+    output_args_to(kind, h264, fps, None)
+}
+
+/// `output_args`, with the file a recording is written to when it has been chosen
+/// already (see `reserve_record_file`).
+pub fn output_args_to(
+    kind: &StreamKind,
+    h264: Option<&str>,
+    fps: u32,
+    record_file: Option<&std::path::Path>,
+) -> Result<Vec<String>, String> {
     let list = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     match kind {
         StreamKind::VirtualCamera { device } => {
@@ -385,26 +449,30 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
                 }
                 .into());
             };
-            let mut a = Vec::new();
+            // The file is made before FFmpeg starts (so two recordings never share a
+            // name), so it is there, empty, to be written over. Timestamps are kept
+            // constant-rate from the clock, so a frame the capture skipped does not
+            // shorten the picture against the sound.
+            let mut a = list(&["-y", "-fps_mode", "cfr"]);
             if let Some(area) = area {
                 a.extend(list(&["-vf", &crop_filter(*area)]));
             }
             match codec {
-                crate::show::RecordCodec::H264 => {
-                    // A file is not a live stream: B-frames and a slower
-                    // preset are fine, and the 2 s keyframes help seeking.
-                    a.extend(h264_args(enc, *kbps, fps));
-                }
+                crate::show::RecordCodec::H264 => a.extend(record_h264_args(enc, *kbps, fps)),
                 crate::show::RecordCodec::H265 => a.extend(hevc_args(enc, *kbps, fps)),
             }
             if audio.is_some() {
-                a.extend(list(&["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k"]));
+                a.extend(list(&[
+                    "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k",
+                ]));
             }
-            let path = record_path(folder, *container, &jiff::Zoned::now());
+            let path = record_file
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| record_path(folder, *container, &jiff::Zoned::now()));
             a.push(path.to_string_lossy().into_owned());
             Ok(a)
         }
-        StreamKind::DeckLink { device, size } => {
+        StreamKind::DeckLink { device, size, ntsc } => {
             let device = device.trim();
             if device.is_empty() {
                 return Err("no Blackmagic output chosen".into());
@@ -421,6 +489,9 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
                     return Err(format!("\"{size}\" isn't a size like 1920x1080"));
                 }
                 a.extend(list(&["-s", size]));
+            }
+            if *ntsc {
+                a.extend(list(&["-r", &format!("{}/1001", fps.max(1) * 1000)]));
             }
             a.extend(list(&["-f", "decklink"]));
             a.push(device.to_string());
@@ -441,8 +512,8 @@ const NO_H264: &str = "This computer's FFmpeg has no H.264 encoder that works he
     VideoToolbox, NVENC, Quick Sync or AMF with its hardware): use a Custom FFmpeg output or \
     install an FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
 
-const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, or \r
-    VideoToolbox, NVENC, Quick Sync or AMF with its hardware): record as H.264, or install an FFmpeg \r
+const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, or \
+    VideoToolbox, NVENC, Quick Sync or AMF with its hardware): record as H.264, or install an FFmpeg \
     with libx265 and point NEWQ_FFMPEG_DIR at it";
 
 /// What this FFmpeg can do, asked once: its encoders, muxers and protocols.
@@ -659,12 +730,29 @@ pub struct Sink {
     patience: std::time::Duration,
     /// Feeds a recording's sound to FFmpeg.
     audio: Option<AudioPump>,
+    /// The file a recording is written to; removed if nothing was written to it.
+    record_file: Option<std::path::PathBuf>,
+}
+
+/// Remove `file` if it is empty: a recording that never began.
+fn drop_empty(file: Option<&std::path::Path>) {
+    if let Some(f) = file
+        && std::fs::metadata(f).is_ok_and(|m| m.len() == 0)
+    {
+        let _ = std::fs::remove_file(f);
+    }
 }
 
 /// The thread that hands a recording's sound to FFmpeg over a local socket.
 struct AudioPump {
     stop: Arc<std::sync::atomic::AtomicBool>,
-    handle: std::thread::JoinHandle<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AudioPump {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl AudioPump {
@@ -673,10 +761,7 @@ impl AudioPump {
     fn start(tap: crate::media::audio::AudioTap) -> Result<(AudioPump, u16), String> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("could not set up the sound for the recording: {e}"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|e| e.to_string())?
-            .port();
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
@@ -684,7 +769,13 @@ impl AudioPump {
             .name("record-audio".into())
             .spawn(move || pump_audio(listener, tap, flag))
             .map_err(|e| e.to_string())?;
-        Ok((AudioPump { stop, handle }, port))
+        Ok((
+            AudioPump {
+                stop,
+                handle: Some(handle),
+            },
+            port,
+        ))
     }
 }
 
@@ -710,6 +801,9 @@ fn pump_audio(
     };
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
+    // FFmpeg that has stopped reading must not hold this thread, nor the
+    // recording's end, for good.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
     // What was played before FFmpeg was ready is not wanted: it would put the
     // sound ahead of the picture.
     if let Ok(old) = tap.consumer.read_chunk(tap.consumer.slots()) {
@@ -729,7 +823,7 @@ fn pump_audio(
                 }
                 chunk.commit_all();
             }
-        } else if last.elapsed() > std::time::Duration::from_millis(100) {
+        } else if last.elapsed() > std::time::Duration::from_millis(300) {
             let frames = (last.elapsed().as_secs_f64() * rate as f64) as usize;
             bytes.resize(frames * 2 * 4, 0);
         }
@@ -753,9 +847,7 @@ pub const FINISH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(
 /// (closing an mp4 can take a while), so it is given much longer than a live stream.
 pub fn finish_patience(kind: &StreamKind) -> std::time::Duration {
     match kind {
-        StreamKind::Custom { .. } | StreamKind::Record { .. } => {
-            std::time::Duration::from_secs(60)
-        }
+        StreamKind::Custom { .. } | StreamKind::Record { .. } => std::time::Duration::from_secs(60),
         _ => FINISH_PATIENCE,
     }
 }
@@ -811,6 +903,7 @@ impl Sink {
             });
         }
         let mut pump = None;
+        let mut record_file: Option<std::path::PathBuf> = None;
         let mut cmd = if let StreamKind::Ndi { name } = kind {
             let name = name.trim();
             if name.is_empty() {
@@ -852,16 +945,29 @@ impl Sink {
             if let Some(name) = chosen {
                 log::info!("stream encoder: {name}");
             }
-            if let StreamKind::Record { folder, container, .. } = kind {
-                let dir = record_path(folder, *container, &jiff::Zoned::now());
-                if let Some(dir) = dir.parent() {
-                    std::fs::create_dir_all(dir)
-                        .map_err(|e| format!("could not make the folder {}: {e}", dir.display()))?;
-                }
+            if let StreamKind::Record {
+                folder, container, ..
+            } = kind
+            {
+                record_file = Some(reserve_record_file(folder, *container)?);
             }
-            let output = output_args(kind, chosen, fps)?;
+            let output = output_args_to(kind, chosen, fps, record_file.as_deref());
+            let output = match output {
+                Ok(o) => o,
+                Err(e) => {
+                    drop_empty(record_file.as_deref());
+                    return Err(e);
+                }
+            };
             let mut cmd = ff.command();
-            cmd.args(input_args(size, fps));
+            let mut video = input_args(size, fps);
+            if record_file.is_some()
+                && let Some(at) = video.iter().position(|a| a == "-i")
+            {
+                // Frames are stamped by the clock as they arrive.
+                video.splice(at..at, ["-use_wallclock_as_timestamps".into(), "1".into()]);
+            }
+            cmd.args(video);
             if let Some(tap) = audio {
                 let rate = tap.sample_rate;
                 let (p, port) = AudioPump::start(tap)?;
@@ -873,9 +979,13 @@ impl Sink {
             cmd
         };
         cmd.stdin(Stdio::piped()).stdout(Stdio::null());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("could not start FFmpeg: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                drop_empty(record_file.as_deref());
+                return Err(format!("could not start FFmpeg: {e}"));
+            }
+        };
         let stdin = child.stdin.take();
         let said = Arc::new(parking_lot::Mutex::new(String::new()));
         if let Some(mut err) = child.stderr.take() {
@@ -905,6 +1015,7 @@ impl Sink {
             _job,
             patience: finish_patience(kind),
             audio: pump,
+            record_file,
         })
     }
 
@@ -956,9 +1067,11 @@ impl Sink {
     /// for `finish_patience`: then it is killed.
     pub fn finish(mut self) {
         self.stdin = None;
-        if let Some(p) = self.audio.take() {
+        if let Some(mut p) = self.audio.take() {
             p.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = p.handle.join();
+            if let Some(h) = p.handle.take() {
+                let _ = h.join();
+            }
         }
         let patience = self.patience;
         let deadline = std::time::Instant::now() + patience;
@@ -971,6 +1084,7 @@ impl Sink {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let _ = self.child.wait();
+        drop_empty(self.record_file.as_deref());
     }
 }
 
@@ -982,6 +1096,7 @@ impl Drop for Sink {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        drop_empty(self.record_file.as_deref());
     }
 }
 
@@ -1042,22 +1157,36 @@ mod tests {
         let k = |device: &str, size: &str| StreamKind::DeckLink {
             device: device.into(),
             size: size.into(),
+            ntsc: false,
         };
         let a = output_args(&k(" UltraStudio Express Monitor ", ""), None, 30).unwrap();
         assert_eq!(
             a,
-            ["-pix_fmt", "uyvy422", "-f", "decklink", "UltraStudio Express Monitor"]
+            [
+                "-pix_fmt",
+                "uyvy422",
+                "-f",
+                "decklink",
+                "UltraStudio Express Monitor"
+            ]
         );
         let b = output_args(&k("Mini Monitor", "1920x1080"), None, 60).unwrap();
         assert_eq!(
             b,
-            ["-pix_fmt", "uyvy422", "-s", "1920x1080", "-f", "decklink", "Mini Monitor"]
+            [
+                "-pix_fmt",
+                "uyvy422",
+                "-s",
+                "1920x1080",
+                "-f",
+                "decklink",
+                "Mini Monitor"
+            ]
         );
         assert!(output_args(&k("", ""), None, 30).is_err());
         assert!(output_args(&k("Mini Monitor", "big"), None, 30).is_err());
         assert!(output_args(&k("Mini Monitor", "0x1080"), None, 30).is_err());
     }
-
 
     #[test]
     fn a_recording_has_its_codec_area_and_a_dated_file() {
@@ -1076,10 +1205,14 @@ mod tests {
             30,
         )
         .unwrap();
+        assert!(a.contains(&"-y".to_string()) && a.join(" ").contains("-fps_mode cfr"));
         assert!(!a.contains(&"-vf".to_string()));
         assert!(a.join(" ").contains("-c:v libx264"));
         let file = a.last().unwrap();
-        assert!(file.replace('\\', "/").starts_with("C:/Rec/NewQ 20") && file.ends_with(".mkv"), "{file}");
+        assert!(
+            file.replace('\\', "/").starts_with("C:/Rec/NewQ 20") && file.ends_with(".mkv"),
+            "{file}"
+        );
         let b = output_args(
             &kind(
                 RecordCodec::H265,
@@ -1096,17 +1229,30 @@ mod tests {
         )
         .unwrap();
         let line = b.join(" ");
-        assert!(line.contains("-c:v libx265") && line.contains("-tag:v hvc1"), "{line}");
+        assert!(
+            line.contains("-c:v libx265") && line.contains("-tag:v hvc1"),
+            "{line}"
+        );
         assert!(
             line.contains("-vf crop=trunc(iw*0.5000/2)*2:trunc(ih*1.0000/2)*2:trunc(iw*0.2500/2)*2:trunc(ih*0.0000/2)*2"),
             "{line}"
         );
         assert!(b.last().unwrap().ends_with(".mov"));
         // No encoder of the codec: it says which.
-        let none = output_args(&kind(RecordCodec::H265, RecordContainer::Mov, None), None, 30);
+        let none = output_args(
+            &kind(RecordCodec::H265, RecordContainer::Mov, None),
+            None,
+            30,
+        );
         assert!(none.unwrap_err().contains("H.265"));
         // An area is kept inside the picture.
-        let wild = RecordArea { x: 0.9, y: -1.0, w: 5.0, h: 0.0 }.clamped();
+        let wild = RecordArea {
+            x: 0.9,
+            y: -1.0,
+            w: 5.0,
+            h: 0.0,
+        }
+        .clamped();
         assert!(wild.x + wild.w <= 1.0 && wild.y == 0.0 && wild.h >= 0.01);
         // Closing a file takes time, so a recording is given as long as a Custom output.
         assert_eq!(
@@ -1117,10 +1263,15 @@ mod tests {
 
     #[test]
     fn a_recording_with_no_folder_goes_to_downloads() {
-        let at: jiff::Zoned = "2026-11-09T14:05:09-05:00[America/New_York]".parse().unwrap();
+        let at: jiff::Zoned = "2026-11-09T14:05:09-05:00[America/New_York]"
+            .parse()
+            .unwrap();
         let p = record_path("", crate::show::RecordContainer::Mp4, &at);
         assert_eq!(p.file_name().unwrap(), "NewQ 2026-11-09 14.05.09.mp4");
-        assert!(p.parent().unwrap().ends_with("Downloads") || p.parent().unwrap() == std::path::Path::new("."));
+        assert!(
+            p.parent().unwrap().ends_with("Downloads")
+                || p.parent().unwrap() == std::path::Path::new(".")
+        );
     }
 
     /// Record a second of frames for real, in each codec this computer can
@@ -1138,7 +1289,12 @@ mod tests {
             (
                 RecordCodec::H264,
                 RecordContainer::Mov,
-                Some(RecordArea { x: 0.25, y: 0.25, w: 0.5, h: 0.5 }),
+                Some(RecordArea {
+                    x: 0.25,
+                    y: 0.25,
+                    w: 0.5,
+                    h: 0.5,
+                }),
             ),
             (RecordCodec::H265, RecordContainer::Mp4, None),
         ] {
@@ -1165,14 +1321,29 @@ mod tests {
                 sink.write(&frame).expect("write");
             }
             sink.finish();
-            let file = std::fs::read_dir(&sub).unwrap().next().expect("a file").unwrap().path();
+            let file = std::fs::read_dir(&sub)
+                .unwrap()
+                .next()
+                .expect("a file")
+                .unwrap()
+                .path();
             let mut probe = ff.command();
-            probe.args(["-loglevel", "info", "-i"]).arg(&file).args(["-f", "null", "-"]);
+            probe
+                .args(["-loglevel", "info", "-i"])
+                .arg(&file)
+                .args(["-f", "null", "-"]);
             let out = probe.output().unwrap();
-            assert!(out.status.success(), "{file:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{file:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let text = String::from_utf8_lossy(&out.stderr);
             let want = if area.is_some() { "320x180" } else { "640x360" };
-            assert!(text.contains(want) && !text.contains("rror"), "{file:?} should be {want}: {text}");
+            assert!(
+                text.contains(want) && !text.contains("rror"),
+                "{file:?} should be {want}: {text}"
+            );
             let size = std::fs::metadata(&file).unwrap().len();
             assert!(size > 1000, "{file:?} is {size} bytes");
         }
@@ -1189,7 +1360,8 @@ mod tests {
         if encoder(&ff).is_none() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("newq_test_record_audio_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("newq_test_record_audio_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for container in [RecordContainer::Mkv, RecordContainer::Mov] {
             let sub = dir.join(format!("{container:?}"));
@@ -1219,7 +1391,8 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
             });
-            let mut sink = Sink::start_with_audio(&ff, (320, 180), 30, &kind, Some(tap)).expect("start");
+            let mut sink =
+                Sink::start_with_audio(&ff, (320, 180), 30, &kind, Some(tap)).expect("start");
             let frame = vec![90u8; 320 * 180 * 4];
             let began = std::time::Instant::now();
             for i in 0..60u32 {
@@ -1232,13 +1405,27 @@ mod tests {
             }
             sink.finish();
             feeder.join().unwrap();
-            let file = std::fs::read_dir(&sub).unwrap().next().expect("a file").unwrap().path();
+            let file = std::fs::read_dir(&sub)
+                .unwrap()
+                .next()
+                .expect("a file")
+                .unwrap()
+                .path();
             let mut probe = ff.command();
-            probe.args(["-loglevel", "info", "-i"]).arg(&file).args(["-f", "null", "-"]);
+            probe
+                .args(["-loglevel", "info", "-i"])
+                .arg(&file)
+                .args(["-f", "null", "-"]);
             let out = probe.output().unwrap();
             let text = String::from_utf8_lossy(&out.stderr).into_owned();
-            assert!(out.status.success() && !text.contains("rror"), "{file:?}: {text}");
-            assert!(text.contains("Video: h264") && text.contains("Audio: aac"), "{file:?}: {text}");
+            assert!(
+                out.status.success() && !text.contains("rror"),
+                "{file:?}: {text}"
+            );
+            assert!(
+                text.contains("Video: h264") && text.contains("Audio: aac"),
+                "{file:?}: {text}"
+            );
             // About two seconds long (60 frames at 30 a second).
             let secs = text
                 .split("Duration: 00:00:")
@@ -1248,6 +1435,120 @@ mod tests {
                 .unwrap_or(0.0);
             assert!((1.5..3.2).contains(&secs), "{file:?} is {secs} s: {text}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_recordings_that_start_together_get_their_own_files() {
+        use crate::show::RecordContainer;
+        let dir = std::env::temp_dir().join(format!("newq_test_names_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.join("not made yet").to_string_lossy().into_owned();
+        let a = reserve_record_file(&folder, RecordContainer::Mkv).unwrap();
+        let b = reserve_record_file(&folder, RecordContainer::Mkv).unwrap();
+        let c = reserve_record_file(&folder, RecordContainer::Mkv).unwrap();
+        assert!(a != b && b != c && a != c, "{a:?} {b:?} {c:?}");
+        for p in [&a, &b, &c] {
+            assert!(p.exists() && p.extension().unwrap() == "mkv", "{p:?}");
+        }
+        // One that never began leaves no empty file behind.
+        drop_empty(Some(&a));
+        assert!(!a.exists());
+        std::fs::write(&b, b"data").unwrap();
+        drop_empty(Some(&b));
+        assert!(b.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recording_is_not_tuned_for_a_live_viewer() {
+        let live = h264_args("libx264", 8000, 30).join(" ");
+        let file = record_h264_args("libx264", 8000, 30).join(" ");
+        assert!(live.contains("-tune zerolatency") && live.contains("-bf 0"));
+        assert!(
+            !file.contains("zerolatency") && !file.contains("-bf"),
+            "{file}"
+        );
+        assert!(
+            file.contains("-c:v libx264") && file.contains("-b:v 8000k"),
+            "{file}"
+        );
+        let vt = record_h264_args("h264_videotoolbox", 8000, 30).join(" ");
+        assert!(!vt.contains("-realtime"), "{vt}");
+        let nv = record_h264_args("h264_nvenc", 8000, 30).join(" ");
+        assert!(!nv.contains("-tune"), "{nv}");
+    }
+
+    #[test]
+    fn a_blackmagic_ntsc_rate_is_the_rate_over_1_001() {
+        let k = StreamKind::DeckLink {
+            device: "Mini Monitor".into(),
+            size: String::new(),
+            ntsc: true,
+        };
+        let a = output_args(&k, None, 60).unwrap().join(" ");
+        assert!(a.contains("-r 60000/1001 -f decklink"), "{a}");
+        let b = output_args(&k, None, 30).unwrap().join(" ");
+        assert!(b.contains("-r 30000/1001"), "{b}");
+    }
+
+    /// A stall in the picture (the capture skips frames it can't keep up with)
+    /// must not make the file shorter than the time it took.
+    #[test]
+    fn a_stall_in_the_picture_does_not_shorten_the_recording() {
+        use crate::show::{RecordCodec, RecordContainer};
+        let Some(ff) = Ffmpeg::locate() else {
+            return;
+        };
+        if encoder(&ff).is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("newq_test_stall_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kind = StreamKind::Record {
+            folder: dir.to_string_lossy().into_owned(),
+            codec: RecordCodec::H264,
+            container: RecordContainer::Mkv,
+            kbps: 2000,
+            area: None,
+            audio: None,
+        };
+        let mut sink = Sink::start(&ff, (320, 180), 30, &kind).expect("start");
+        let frame = vec![60u8; 320 * 180 * 4];
+        let began = std::time::Instant::now();
+        for i in 0..15u64 {
+            sink.write(&frame).unwrap();
+            std::thread::sleep(
+                std::time::Duration::from_millis((i + 1) * 33).saturating_sub(began.elapsed()),
+            );
+        }
+        // Nothing for a second, then the picture goes on.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        for _ in 0..15 {
+            sink.write(&frame).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
+        sink.finish();
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .expect("a file")
+            .unwrap()
+            .path();
+        let mut probe = ff.command();
+        probe
+            .args(["-loglevel", "info", "-i"])
+            .arg(&file)
+            .args(["-f", "null", "-"]);
+        let text = String::from_utf8_lossy(&probe.output().unwrap().stderr).into_owned();
+        let secs = text
+            .split("Duration: 00:00:")
+            .nth(1)
+            .and_then(|r| r.get(..5))
+            .and_then(|r| r.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        // About two seconds went by; without the fix the file is one.
+        assert!((1.7..3.0).contains(&secs), "{secs} s: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

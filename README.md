@@ -553,14 +553,19 @@ enter, and *Test Mode* downloads its free test media when you start it.
     14.05.09.mov`). Tick *Record sound* to put a copy of what one of the show's
     audio outputs plays into the file as AAC (the two channels you choose of
     that device, at the volume heard, so Mute All mutes it too); it is picture
-    only otherwise. Sound and picture are lined up as the recording starts, to
-    within a fraction of a second, with no sync correction after. Choose the *Folder* (the Downloads folder if empty), the
+    only otherwise. Picture and sound are both timed by the clock as they arrive, so a frame the
+    computer skipped doesn't shorten the picture against the sound; they start
+    together to within a fraction of a second. Choose the *Folder* (the Downloads folder if empty), the
     *Codec* (H.264 or H.265), the *Container* (MOV, MKV or MP4) and the
     *Bitrate*; the picture's size is the height set for the send-out, and
     *Record only part of the picture* keeps a rectangle of it (left, top,
     width and height as a percentage of the picture). Stopping closes the file,
-    which can take a few seconds, and NewQ waits up to a minute for it; MKV
-    survives the computer stopping mid-recording best. H.265 needs an FFmpeg
+    which can take a few seconds, and NewQ waits up to a minute for it (also when
+    you quit). A name that is taken gets (2), (3) after it, so two recordings that
+    start together keep their own files, and changing a setting while recording
+    starts a new file. **MKV is the default because it survives NewQ or the
+    computer stopping suddenly; a MOV or MP4 cut off before it is closed can be
+    unplayable** (the panel warns of this when either is chosen). H.265 needs an FFmpeg
     with libx265 or a working hardware encoder (NewQ's Windows and Linux ones
     have only the hardware ones). A display has one send-out, so it can record
     or stream, not both. Checked here with H.264 and H.265 on Windows (AMD
@@ -576,8 +581,9 @@ enter, and *Test Mode* downloads its free test media when you start it.
     it needs an FFmpeg built with `--enable-decklink` in the folder named by
     `NEWQ_FFMPEG_DIR`, and Blackmagic's Desktop Video installed. *Find* lists
     the devices; give a size (e.g. `1920x1080`) if the display's own size
-    isn't one the device has, and the display's frame rate must also be one of
-    its modes. Picture only, no sound. The Mini Recorder and Express Recorder
+    isn't one the device has. The display's frame rate must also be one of the
+    device's modes, and *29.97 / 59.94 style* divides it by 1.001 for modes such
+    as 1080p59.94. Picture only, no sound. The Mini Recorder and Express Recorder
     are inputs, and use the Blackmagic camera support above. **Written from
     FFmpeg's documented output and not tried with any Blackmagic hardware.**
   - *Custom FFmpeg output*: the arguments that follow the input (the picture

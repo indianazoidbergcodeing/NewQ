@@ -4689,6 +4689,7 @@ fn stream_editor(
                                 StreamKind::DeckLink {
                                     device: String::new(),
                                     size: String::new(),
+                                    ntsc: false,
                                 },
                                 StreamKind::Record {
                                     folder: String::new(),
@@ -4760,8 +4761,14 @@ fn stream_editor(
                         } => {
                             ui.label("Folder");
                             ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(folder)
+                                // A copy is edited and taken when the box is left, so a folder
+                                // typed letter by letter is not a recording started in each.
+                                let typed_id = egui::Id::new(("record_folder", d.id.0));
+                                let mut typed = ui
+                                    .data(|m| m.get_temp::<String>(typed_id))
+                                    .unwrap_or_else(|| folder.clone());
+                                let r = ui.add(
+                                    egui::TextEdit::singleline(&mut typed)
                                         .hint_text(
                                             crate::stream::default_record_folder()
                                                 .to_string_lossy()
@@ -4769,6 +4776,14 @@ fn stream_editor(
                                         )
                                         .desired_width(200.0),
                                 );
+                                if r.lost_focus() {
+                                    *folder = typed.clone();
+                                }
+                                if r.has_focus() {
+                                    ui.data_mut(|m| m.insert_temp(typed_id, typed));
+                                } else {
+                                    ui.data_mut(|m| m.remove_temp::<String>(typed_id));
+                                }
                                 if ui.button("Browse…").clicked()
                                     && let Some(p) = rfd::FileDialog::new()
                                         .set_title("Record into…")
@@ -4792,10 +4807,23 @@ fn stream_editor(
                                 }
                             });
                             ui.end_row();
+                            if *container != crate::show::RecordContainer::Mkv {
+                                ui.label("");
+                                ui.label(
+                                    RichText::new(
+                                        "⚠ If NewQ or the computer stops suddenly, a recording \
+                                         that isn't MKV can be left corrupted and unplayable. \
+                                         MKV survives that.",
+                                    )
+                                    .color(egui::Color32::from_rgb(230, 160, 40))
+                                    .small(),
+                                );
+                                ui.end_row();
+                            }
                             ui.label("Bitrate");
                             ui.add(
                                 egui::DragValue::new(kbps)
-                                    .range(200..=200_000)
+                                    .range(200..=100_000)
                                     .speed(100.0)
                                     .suffix(" kbps"),
                             );
@@ -4880,9 +4908,20 @@ fn stream_editor(
                             });
                             ui.end_row();
                         }
-                        StreamKind::DeckLink { device, size } => {
+                        StreamKind::DeckLink { device, size, ntsc } => {
                             // The devices are looked for when asked (it runs FFmpeg).
                             let found_id = egui::Id::new(("decklink_outputs", d.id.0));
+                            let wait_id = egui::Id::new(("decklink_waiting", d.id.0));
+                            if let Some(rx) = ui.data(|m| m.get_temp::<Option<crossbeam_channel::Receiver<Vec<String>>>>(wait_id)).flatten() {
+                                if let Ok(list) = rx.try_recv() {
+                                    ui.data_mut(|m| {
+                                        m.insert_temp(found_id, list);
+                                        m.insert_temp(wait_id, None::<crossbeam_channel::Receiver<Vec<String>>>);
+                                    });
+                                } else {
+                                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                                }
+                            }
                             ui.label("Device");
                             ui.horizontal(|ui| {
                                 ui.add(
@@ -4895,8 +4934,9 @@ fn stream_editor(
                                     .on_hover_text("Look for Blackmagic devices that can be sent to")
                                     .clicked()
                                 {
-                                    let list = engine.decklink_outputs();
-                                    ui.data_mut(|m| m.insert_temp(found_id, list));
+                                    // Asked on a thread: it runs FFmpeg, which can take a while.
+                                    let rx = engine.decklink_outputs_later();
+                                    ui.data_mut(|m| m.insert_temp(wait_id, Some(rx)));
                                 }
                             });
                             ui.end_row();
@@ -4928,6 +4968,10 @@ fn stream_editor(
                                     .hint_text("display's own size, or e.g. 1920x1080")
                                     .desired_width(200.0),
                             );
+                            ui.end_row();
+                            ui.label("Rate");
+                            ui.checkbox(ntsc, "29.97 / 59.94 style (the frame rate divided by 1.001)")
+                                .on_hover_text("For a mode such as 1080p59.94 rather than 1080p60");
                             ui.end_row();
                         }
                         StreamKind::Server {
@@ -5114,10 +5158,11 @@ fn stream_editor(
                         }
                     }
                     StreamKind::Record { .. } => {
-                        "Records the picture (no sound) to a new file each time it starts, named \r
-                         by the day and time. The size is the height below; an area keeps only \r
-                         part of the picture. Stopping closes the file, which can take a few \r
-                         seconds. MKV is the safest if the computer might stop mid-recording."
+                        "Records the picture (and, if ticked, the sound) to a new file each time it \
+                         starts, named by the day and time; changing a setting while it records \
+                         starts a new file. The size is the height below; an area keeps only \
+                         part of the picture. Stopping closes the file, which can take a few \
+                         seconds."
                     }
                     StreamKind::DeckLink { .. } => {
                         "Sends the picture (no sound) to a Blackmagic UltraStudio or DeckLink \

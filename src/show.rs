@@ -636,6 +636,9 @@ pub enum StreamKind {
         device: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         size: String,
+        /// The rate is the display's divided by 1.001 (29.97, 59.94).
+        #[serde(default, skip_serializing_if = "is_false")]
+        ntsc: bool,
     },
     /// Publishing to a streaming server such as MediaMTX, which then serves the
     /// picture to any number of viewers (RTSP, RTMP or SRT). H.264, picture only.
@@ -692,9 +695,10 @@ impl RecordCodec {
 /// The file a recording is written to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordContainer {
-    #[default]
     Mov,
-    /// Survives NewQ or the computer stopping mid-recording better than the others.
+    /// Survives NewQ or the computer stopping mid-recording; the others are
+    /// unplayable if it stops before they are closed.
+    #[default]
     Mkv,
     Mp4,
 }
@@ -6002,6 +6006,76 @@ mod tests {
         let t = slide_times(&show, g);
         assert_eq!((t[0].0, t[2].0), (0.0, 6.0));
         assert_eq!(t[2].2, Some(8.0));
+    }
+
+    #[test]
+    fn recordings_and_blackmagic_outputs_are_saved_with_only_what_was_chosen() {
+        use super::{RecordArea, RecordAudio, RecordCodec, RecordContainer, StreamKind, StreamOut};
+        // The default recording is MKV, because it survives a sudden stop.
+        assert_eq!(RecordContainer::default(), RecordContainer::Mkv);
+        let rec = StreamOut {
+            enabled: true,
+            kind: StreamKind::Record {
+                folder: String::new(),
+                codec: RecordCodec::default(),
+                container: RecordContainer::default(),
+                kbps: 16_000,
+                area: None,
+                audio: None,
+            },
+            fps: 30,
+            height: 720,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        for left_out in ["folder", "kbps", "area", "audio"] {
+            assert!(!json.contains(left_out), "{left_out} in {json}");
+        }
+        assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), rec);
+        // Everything chosen comes back.
+        let chosen = StreamOut {
+            kind: StreamKind::Record {
+                folder: "D:/Rec".into(),
+                codec: RecordCodec::H265,
+                container: RecordContainer::Mov,
+                kbps: 30_000,
+                area: Some(RecordArea {
+                    x: 0.1,
+                    y: 0.2,
+                    w: 0.5,
+                    h: 0.5,
+                }),
+                audio: Some(RecordAudio {
+                    output: Some(AudioOutputId(3)),
+                    channel: 2,
+                }),
+            },
+            ..rec.clone()
+        };
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), chosen);
+        // A recording saved with only its kind loads with the defaults.
+        let bare: StreamOut =
+            serde_json::from_str(r#"{"enabled":true,"kind":{"Record":{}},"fps":30,"height":720}"#)
+                .unwrap();
+        assert_eq!(bare, rec);
+        // A Blackmagic output leaves out its size and rate when not set.
+        let dl = StreamOut {
+            kind: StreamKind::DeckLink {
+                device: "Mini Monitor".into(),
+                size: String::new(),
+                ntsc: false,
+            },
+            ..rec.clone()
+        };
+        let json = serde_json::to_string(&dl).unwrap();
+        assert!(!json.contains("size") && !json.contains("ntsc"), "{json}");
+        assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), dl);
+        // Shows saved before these existed still load.
+        let old: StreamOut = serde_json::from_str(
+            r#"{"enabled":false,"kind":{"Udp":{"host":"127.0.0.1","port":5000}},"fps":30,"height":720}"#,
+        )
+        .unwrap();
+        assert!(matches!(old.kind, StreamKind::Udp { .. }));
     }
 
     #[test]

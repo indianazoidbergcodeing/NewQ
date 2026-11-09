@@ -237,7 +237,6 @@ impl Device {
     }
 }
 
-
 /// Where a recording takes a copy of the sound a device plays: stereo,
 /// from a pair of the device's channels, into a ring that the recording
 /// reads. The audio callback only ever `try_lock`s it, so a recording can
@@ -249,6 +248,12 @@ struct TapIn {
     producer: rtrb::Producer<f32>,
     /// The first of the two device channels that are copied.
     first: usize,
+    /// Which recording's tap this is, so that one ending doesn't take down the
+    /// tap of the one that replaced it.
+    id: u64,
+    /// The device's rate when it was set up; a device that comes back at
+    /// another rate can't keep the tap.
+    rate: u32,
 }
 
 impl TapSlot {
@@ -284,8 +289,8 @@ pub struct AudioTap {
     pub consumer: rtrb::Consumer<f32>,
     pub sample_rate: u32,
     slot: TapSlot,
+    id: u64,
 }
-
 
 #[cfg(test)]
 impl AudioTap {
@@ -298,6 +303,7 @@ impl AudioTap {
                 consumer,
                 sample_rate,
                 slot: TapSlot::default(),
+                id: 0,
             },
         )
     }
@@ -305,7 +311,11 @@ impl AudioTap {
 
 impl Drop for AudioTap {
     fn drop(&mut self) {
-        *self.slot.0.lock() = None;
+        // Only its own: a newer recording may have taken the slot over.
+        let mut slot = self.slot.0.lock();
+        if slot.as_ref().is_some_and(|t| t.id == self.id) {
+            *slot = None;
+        }
     }
 }
 
@@ -431,7 +441,16 @@ impl AudioOut {
                 None => !present.is_empty(),
             };
             if could_open && (d.error.is_some() || d.lost.is_set()) {
+                let recording = d.tap.0.lock().take();
                 *d = Device::open_again(k.as_deref(), d.error.as_deref());
+                // A recording that was running keeps its sound, if the device
+                // comes back as it was.
+                if let Some(t) = recording
+                    && d.open
+                    && t.rate == d.sample_rate
+                {
+                    *d.tap.0.lock() = Some(t);
+                }
             }
         }
     }
@@ -472,16 +491,20 @@ impl AudioOut {
         let Some(d) = self.device_for(output).filter(|d| d.open) else {
             return Err("that audio output isn't open".into());
         };
-        let (producer, consumer) =
-            rtrb::RingBuffer::new(d.sample_rate as usize * 2 * 2);
+        let (producer, consumer) = rtrb::RingBuffer::new(d.sample_rate as usize * 2 * 2);
+        static NEXT_TAP: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_TAP.fetch_add(1, Ordering::Relaxed);
         *d.tap.0.lock() = Some(TapIn {
             producer,
             first: usize::from(first).min(usize::from(d.channels.saturating_sub(1))),
+            id,
+            rate: d.sample_rate,
         });
         Ok(AudioTap {
             consumer,
             sample_rate: d.sample_rate,
             slot: d.tap.clone(),
+            id,
         })
     }
 
@@ -1340,10 +1363,18 @@ fn open_stream(
     let config = supported.config();
     let (sr, channels) = (config.sample_rate, config.channels);
     let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, voices_rx, master, lost, stats, tap)?,
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, voices_rx, master, lost, stats, tap)?,
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, voices_rx, master, lost, stats, tap)?,
-        cpal::SampleFormat::I32 => build::<i32>(&device, config, voices_rx, master, lost, stats, tap)?,
+        cpal::SampleFormat::F32 => {
+            build::<f32>(&device, config, voices_rx, master, lost, stats, tap)?
+        }
+        cpal::SampleFormat::I16 => {
+            build::<i16>(&device, config, voices_rx, master, lost, stats, tap)?
+        }
+        cpal::SampleFormat::U16 => {
+            build::<u16>(&device, config, voices_rx, master, lost, stats, tap)?
+        }
+        cpal::SampleFormat::I32 => {
+            build::<i32>(&device, config, voices_rx, master, lost, stats, tap)?
+        }
         other => return Err(anyhow!("unsupported sample format {other:?}")),
     };
     stream.play()?;
@@ -1588,10 +1619,28 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_that_ends_does_not_take_the_tap_of_the_one_that_replaced_it() {
+        let (out, _) = AudioOut::with_working_device();
+        let old = out.tap(None, 0).unwrap();
+        // The restart takes a new tap before the old recording has let go.
+        let new = out.tap(None, 0).unwrap();
+        drop(old);
+        let device = out.devices.get(&None).unwrap();
+        assert!(device.tap.0.lock().is_some(), "the new tap was cleared");
+        drop(new);
+        assert!(device.tap.0.lock().is_none());
+    }
+
+    #[test]
     fn a_recordings_copy_of_the_sound_is_a_pair_of_channels_at_the_volume_heard() {
         let slot = TapSlot::default();
         let (producer, mut consumer) = rtrb::RingBuffer::new(64);
-        *slot.0.lock() = Some(TapIn { producer, first: 1 });
+        *slot.0.lock() = Some(TapIn {
+            producer,
+            first: 1,
+            id: 1,
+            rate: 48_000,
+        });
         // Two frames of a four-channel mix, heard at half volume.
         let mix = [0.0, 0.4, -0.6, 0.0, 0.0, 1.0, 1.0, 0.0];
         slot.push(&mix, 4, 0.5);
@@ -1599,20 +1648,29 @@ mod tests {
         assert_eq!(got, vec![0.2, -0.3, 0.5, 0.5]);
         // A one-channel device is heard on both sides.
         let (producer, mut consumer) = rtrb::RingBuffer::new(8);
-        *slot.0.lock() = Some(TapIn { producer, first: 0 });
+        *slot.0.lock() = Some(TapIn {
+            producer,
+            first: 0,
+            id: 1,
+            rate: 48_000,
+        });
         slot.push(&[0.25], 1, 1.0);
         let got: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
         assert_eq!(got, vec![0.25, 0.25]);
         // A full ring drops sound rather than wait, and a recording that has
         // gone takes the tap with it.
         let (producer, consumer) = rtrb::RingBuffer::new(2);
-        *slot.0.lock() = Some(TapIn { producer, first: 0 });
+        *slot.0.lock() = Some(TapIn {
+            producer,
+            first: 0,
+            id: 1,
+            rate: 48_000,
+        });
         slot.push(&[0.1, 0.1, 0.1, 0.1], 2, 1.0);
         drop(consumer);
         slot.push(&[0.1, 0.1], 2, 1.0);
         assert!(slot.0.lock().is_none());
     }
-
 
     #[test]
     fn a_frame_is_routed_to_the_chosen_channels() {
