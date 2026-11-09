@@ -64,6 +64,7 @@ The README describes the features; this file is about working on the code.
   (`Prefs::let_computer_sleep` turns it off), logs sleeps (`SleepWatch`) and the power source, and sets
   `UiState::keeping_awake/on_battery` for the status bar and the General page's badge.
 - `src/app.rs`: windows and wiring. `src/ui.rs`: the control UI.
+  `src/ui/modern.rs`: the optional new interface (`Prefs::new_layout`, Window menu; `Action::SetNewLayout`): `draw` replaces the transport and dock when it is on, with `View`s Editor (cue list, inspector, active), Operator and Patch (painter-drawn signal flow; a drag from a cue port sets `MediaCue::output` or `audio_output`), reusing `cue_list`, `inspector`, `active_panel` and `output_previews`. The settings take the view's place while open. Tests draw each view and drag routes; `PatchRects` is test-only.
   `src/ui/settings.rs`: the settings page (a sidebar of `SettingsPage`s in
   groups, with badges; it replaces the cue list while open). A setting goes on
   the page it belongs to; the displays, audio and sub display panels are
