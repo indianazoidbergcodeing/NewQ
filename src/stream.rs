@@ -375,6 +375,7 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
             container,
             kbps,
             area,
+            audio,
         } => {
             // `encoder` is the one for the codec (see `Sink::start`).
             let Some(enc) = h264 else {
@@ -395,6 +396,9 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
                     a.extend(h264_args(enc, *kbps, fps));
                 }
                 crate::show::RecordCodec::H265 => a.extend(hevc_args(enc, *kbps, fps)),
+            }
+            if audio.is_some() {
+                a.extend(list(&["-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k"]));
             }
             let path = record_path(folder, *container, &jiff::Zoned::now());
             a.push(path.to_string_lossy().into_owned());
@@ -653,6 +657,91 @@ pub struct Sink {
     _job: Option<crate::mediamtx::JobGuard>,
     /// How long `finish` waits before killing FFmpeg (`finish_patience`).
     patience: std::time::Duration,
+    /// Feeds a recording's sound to FFmpeg.
+    audio: Option<AudioPump>,
+}
+
+/// The thread that hands a recording's sound to FFmpeg over a local socket.
+struct AudioPump {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl AudioPump {
+    /// Listen on a free local port: FFmpeg connects to it as it opens its sound
+    /// input. Returns the pump and the port.
+    fn start(tap: crate::media::audio::AudioTap) -> Result<(AudioPump, u16), String> {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("could not set up the sound for the recording: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| e.to_string())?
+            .port();
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("record-audio".into())
+            .spawn(move || pump_audio(listener, tap, flag))
+            .map_err(|e| e.to_string())?;
+        Ok((AudioPump { stop, handle }, port))
+    }
+}
+
+/// Wait for FFmpeg to connect, then send it the sound as 32-bit float samples,
+/// as it is played; silence while the device gives none, so FFmpeg is never
+/// left waiting for sound that does not come.
+fn pump_audio(
+    listener: std::net::TcpListener,
+    mut tap: crate::media::audio::AudioTap,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+    let began = std::time::Instant::now();
+    let mut stream = loop {
+        if stop.load(Relaxed) || began.elapsed() > std::time::Duration::from_secs(20) {
+            return;
+        }
+        match listener.accept() {
+            Ok((s, _)) => break s,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_nodelay(true);
+    // What was played before FFmpeg was ready is not wanted: it would put the
+    // sound ahead of the picture.
+    if let Ok(old) = tap.consumer.read_chunk(tap.consumer.slots()) {
+        old.commit_all();
+    }
+    let rate = tap.sample_rate.max(8000) as usize;
+    let mut last = std::time::Instant::now();
+    let mut bytes: Vec<u8> = Vec::new();
+    while !stop.load(Relaxed) {
+        bytes.clear();
+        let ready = tap.consumer.slots() / 2 * 2;
+        if ready > 0 {
+            if let Ok(chunk) = tap.consumer.read_chunk(ready) {
+                let (a, b) = chunk.as_slices();
+                for s in a.iter().chain(b) {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                chunk.commit_all();
+            }
+        } else if last.elapsed() > std::time::Duration::from_millis(100) {
+            let frames = (last.elapsed().as_secs_f64() * rate as f64) as usize;
+            bytes.resize(frames * 2 * 4, 0);
+        }
+        if bytes.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        if stream.write_all(&bytes).is_err() {
+            return;
+        }
+        last = std::time::Instant::now();
+    }
 }
 
 /// How long `Sink::finish` lets FFmpeg wind up (flush the encoder, say goodbye to
@@ -695,12 +784,33 @@ impl Killer {
 }
 
 impl Sink {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start(
         ff: &Ffmpeg,
         size: (u32, u32),
         fps: u32,
         kind: &StreamKind,
     ) -> Result<Sink, String> {
+        Self::start_with_audio(ff, size, fps, kind, None)
+    }
+
+    /// `start`, for a recording that has sound: `audio` is the copy of what is played.
+    pub fn start_with_audio(
+        ff: &Ffmpeg,
+        size: (u32, u32),
+        fps: u32,
+        kind: &StreamKind,
+        audio: Option<crate::media::audio::AudioTap>,
+    ) -> Result<Sink, String> {
+        let wants_audio = matches!(kind, StreamKind::Record { audio: Some(_), .. });
+        if wants_audio != audio.is_some() {
+            return Err(if wants_audio {
+                "no sound to record".into()
+            } else {
+                "sound was given to a stream that doesn't record it".into()
+            });
+        }
+        let mut pump = None;
         let mut cmd = if let StreamKind::Ndi { name } = kind {
             let name = name.trim();
             if name.is_empty() {
@@ -751,7 +861,15 @@ impl Sink {
             }
             let output = output_args(kind, chosen, fps)?;
             let mut cmd = ff.command();
-            cmd.args(input_args(size, fps)).args(output);
+            cmd.args(input_args(size, fps));
+            if let Some(tap) = audio {
+                let rate = tap.sample_rate;
+                let (p, port) = AudioPump::start(tap)?;
+                pump = Some(p);
+                cmd.args(["-f", "f32le", "-ar", &rate.to_string(), "-ac", "2"])
+                    .args(["-i", &format!("tcp://127.0.0.1:{port}")]);
+            }
+            cmd.args(output);
             cmd
         };
         cmd.stdin(Stdio::piped()).stdout(Stdio::null());
@@ -786,6 +904,7 @@ impl Sink {
             #[cfg(windows)]
             _job,
             patience: finish_patience(kind),
+            audio: pump,
         })
     }
 
@@ -837,6 +956,10 @@ impl Sink {
     /// for `finish_patience`: then it is killed.
     pub fn finish(mut self) {
         self.stdin = None;
+        if let Some(p) = self.audio.take() {
+            p.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = p.handle.join();
+        }
         let patience = self.patience;
         let deadline = std::time::Instant::now() + patience;
         while matches!(self.child.try_wait(), Ok(None)) {
@@ -854,6 +977,9 @@ impl Sink {
 impl Drop for Sink {
     fn drop(&mut self) {
         self.stdin = None;
+        if let Some(p) = &self.audio {
+            p.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -942,6 +1068,7 @@ mod tests {
             container,
             kbps: 8000,
             area,
+            audio: None,
         };
         let a = output_args(
             &kind(RecordCodec::H264, RecordContainer::Mkv, None),
@@ -1030,6 +1157,7 @@ mod tests {
                 container,
                 kbps: 4000,
                 area,
+                audio: None,
             };
             let mut sink = Sink::start(&ff, (640, 360), 30, &kind).expect("start");
             let frame = vec![128u8; 640 * 360 * 4];
@@ -1050,6 +1178,79 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Record a second of picture with a tone as its sound, and read back that
+    /// the file has both, the sound about as long as the picture.
+    #[test]
+    fn a_recording_can_carry_sound() {
+        use crate::show::{RecordAudio, RecordCodec, RecordContainer};
+        let Some(ff) = Ffmpeg::locate() else {
+            return;
+        };
+        if encoder(&ff).is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("newq_test_record_audio_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for container in [RecordContainer::Mkv, RecordContainer::Mov] {
+            let sub = dir.join(format!("{container:?}"));
+            let kind = StreamKind::Record {
+                folder: sub.to_string_lossy().into_owned(),
+                codec: RecordCodec::H264,
+                container,
+                kbps: 4000,
+                area: None,
+                audio: Some(RecordAudio::default()),
+            };
+            // Without sound to give it, it says so.
+            assert!(Sink::start(&ff, (320, 180), 30, &kind).is_err());
+            let (mut tone, tap) = crate::media::audio::AudioTap::for_test(48_000);
+            let feeder = std::thread::spawn(move || {
+                // A 440 Hz tone, in real time, for a bit more than the picture.
+                let began = std::time::Instant::now();
+                let mut n = 0u64;
+                while began.elapsed() < std::time::Duration::from_millis(2200) {
+                    let due = (began.elapsed().as_secs_f64() * 48_000.0) as u64;
+                    while n < due && tone.slots() >= 2 {
+                        let s = (n as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5;
+                        let _ = tone.push(s);
+                        let _ = tone.push(s);
+                        n += 1;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            let mut sink = Sink::start_with_audio(&ff, (320, 180), 30, &kind, Some(tap)).expect("start");
+            let frame = vec![90u8; 320 * 180 * 4];
+            let began = std::time::Instant::now();
+            for i in 0..60u32 {
+                sink.write(&frame).expect("write");
+                // In real time, as the capture thread is.
+                let due = std::time::Duration::from_millis(u64::from(i + 1) * 33);
+                if let Some(wait) = due.checked_sub(began.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
+            sink.finish();
+            feeder.join().unwrap();
+            let file = std::fs::read_dir(&sub).unwrap().next().expect("a file").unwrap().path();
+            let mut probe = ff.command();
+            probe.args(["-loglevel", "info", "-i"]).arg(&file).args(["-f", "null", "-"]);
+            let out = probe.output().unwrap();
+            let text = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success() && !text.contains("rror"), "{file:?}: {text}");
+            assert!(text.contains("Video: h264") && text.contains("Audio: aac"), "{file:?}: {text}");
+            // About two seconds long (60 frames at 30 a second).
+            let secs = text
+                .split("Duration: 00:00:")
+                .nth(1)
+                .and_then(|r| r.get(..5))
+                .and_then(|r| r.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            assert!((1.5..3.2).contains(&secs), "{file:?} is {secs} s: {text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn each_destination_has_the_arguments_it_needs() {
         let udp = StreamKind::Udp {

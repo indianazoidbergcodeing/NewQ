@@ -4415,6 +4415,11 @@ fn displays_panel(
         .iter()
         .filter_map(|o| Some((o.within?, o.name.clone())))
         .collect();
+    let audio_names: Vec<(AudioOutputId, String)> = show
+        .audio_outputs
+        .iter()
+        .map(|o| (o.id, o.name.clone()))
+        .collect();
     for (di, d) in show
         .outputs
         .iter_mut()
@@ -4511,7 +4516,7 @@ fn displays_panel(
             );
             corner_pin_editor(ui, d, st, actions);
             edge_blend_editor(ui, d, state_size.unwrap_or((1920, 1080)));
-            stream_editor(ui, d, engine, st);
+            stream_editor(ui, d, engine, st, &audio_names);
         });
     }
 }
@@ -4637,7 +4642,13 @@ fn shared_picture_editor(
 
 /// Sending a display's picture out as video: to a virtual camera (Linux), to
 /// OBS over the network, or anywhere FFmpeg can send it.
-fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &UiState) {
+fn stream_editor(
+    ui: &mut Ui,
+    d: &mut OutputConfig,
+    engine: &mut Engine,
+    st: &UiState,
+    audio_names: &[(AudioOutputId, String)],
+) {
     use crate::show::{ServerProtocol, StreamKind, StreamOut};
     let on = d.stream.as_ref().is_some_and(|s| s.enabled);
     egui::CollapsingHeader::new(if on { "Send out ●" } else { "Send out" })
@@ -4685,6 +4696,7 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                                     container: Default::default(),
                                     kbps: 16_000,
                                     area: None,
+                                    audio: None,
                                 },
                                 StreamKind::Custom {
                                     args: String::new(),
@@ -4744,6 +4756,7 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                             container,
                             kbps,
                             area,
+                            audio,
                         } => {
                             ui.label("Folder");
                             ui.horizontal(|ui| {
@@ -4786,6 +4799,53 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                                     .speed(100.0)
                                     .suffix(" kbps"),
                             );
+                            ui.end_row();
+                            ui.label("Sound");
+                            ui.vertical(|ui| {
+                                let mut on = audio.is_some();
+                                if ui
+                                    .checkbox(&mut on, "Record sound")
+                                    .on_hover_text(
+                                        "A copy of what one of the show's audio outputs plays, \
+                                         recorded as AAC with the picture",
+                                    )
+                                    .changed()
+                                {
+                                    *audio = on.then(crate::show::RecordAudio::default);
+                                }
+                                if let Some(a) = audio {
+                                    let name = match a.output {
+                                        Some(id) => audio_names
+                                            .iter()
+                                            .find(|(i, _)| *i == id)
+                                            .map_or("(removed output)".to_string(), |(_, n)| n.clone()),
+                                        None => "Default output".to_string(),
+                                    };
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt(("record_audio", d.id.0))
+                                            .selected_text(name)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut a.output,
+                                                    None,
+                                                    "Default output",
+                                                );
+                                                for (id, n) in audio_names {
+                                                    ui.selectable_value(&mut a.output, Some(*id), n);
+                                                }
+                                            });
+                                        ui.label("Channels");
+                                        let mut first = a.channel + 1;
+                                        if ui
+                                            .add(egui::DragValue::new(&mut first).range(1..=64))
+                                            .changed()
+                                        {
+                                            a.channel = first - 1;
+                                        }
+                                        ui.label(format!("and {}", first + 1));
+                                    });
+                                }
+                            });
                             ui.end_row();
                             ui.label("Area");
                             ui.vertical(|ui| {

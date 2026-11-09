@@ -235,6 +235,7 @@ pub struct OutputThread {
 }
 
 impl OutputThread {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(
         gpu: Gpu,
         window: Arc<Window>,
@@ -388,6 +389,7 @@ pub struct CaptureThread {
 }
 
 impl CaptureThread {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(
         gpu: Gpu,
         slot: Slot,
@@ -399,8 +401,31 @@ impl CaptureThread {
         Self::spawn_slow(gpu, slot, size, fps, ff, kind, std::time::Duration::ZERO)
     }
 
+    /// `spawn`, for a recording that has sound: `audio` is a copy of what is played.
+    pub fn spawn_with_audio(
+        gpu: Gpu,
+        slot: Slot,
+        size: (u32, u32),
+        fps: u32,
+        ff: crate::media::ffmpeg::Ffmpeg,
+        kind: crate::show::StreamKind,
+        audio: Option<crate::media::audio::AudioTap>,
+    ) -> CaptureThread {
+        Self::spawn_inner(
+            gpu,
+            slot,
+            size,
+            fps,
+            ff,
+            kind,
+            std::time::Duration::ZERO,
+            audio,
+        )
+    }
+
     /// `spawn`, with each frame made to take `slow` longer to draw: for
     /// trying a slow graphics card.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn_slow(
         gpu: Gpu,
         slot: Slot,
@@ -409,6 +434,20 @@ impl CaptureThread {
         ff: crate::media::ffmpeg::Ffmpeg,
         kind: crate::show::StreamKind,
         slow: std::time::Duration,
+    ) -> CaptureThread {
+        Self::spawn_inner(gpu, slot, size, fps, ff, kind, slow, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        gpu: Gpu,
+        slot: Slot,
+        size: (u32, u32),
+        fps: u32,
+        ff: crate::media::ffmpeg::Ffmpeg,
+        kind: crate::show::StreamKind,
+        slow: std::time::Duration,
+        audio: Option<crate::media::audio::AudioTap>,
     ) -> CaptureThread {
         let mailbox = Arc::new(Mailbox::new());
         let mb = mailbox.clone();
@@ -421,7 +460,7 @@ impl CaptureThread {
             .spawn(move || {
                 // Started here: asking FFmpeg what it can encode and starting it
                 // can take a while.
-                match crate::stream::Sink::start(&ff, size, fps, &kind) {
+                match crate::stream::Sink::start_with_audio(&ff, size, fps, &kind, audio) {
                     Ok(sink) => {
                         *kill_slot.lock() = Some(sink.killer());
                         capture_loop(gpu, slot, size, fps, slow, sink, mb, err_tx)
@@ -629,6 +668,7 @@ pub struct ControlThread {
 }
 
 impl ControlThread {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(
         gpu: Gpu,
         window: Arc<Window>,

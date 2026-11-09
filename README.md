@@ -548,9 +548,13 @@ enter, and *Test Mode* downloads its free test media when you start it.
     bundled MediaMTX (a viewer joining late, five viewers over RTSP, RTMP and HLS for
     three minutes with flat memory); **not tried on a Mac, nor with NVENC or Quick Sync,
     nor a phone scanning the code**.
-  - *Record to a file*: writes the display's picture (no sound) to a new
+  - *Record to a file*: writes the display's picture to a new
     file each time it starts, named by the day and time (`NewQ 2026-11-09
-    14.05.09.mov`). Choose the *Folder* (the Downloads folder if empty), the
+    14.05.09.mov`). Tick *Record sound* to put a copy of what one of the show's
+    audio outputs plays into the file as AAC (the two channels you choose of
+    that device, at the volume heard, so Mute All mutes it too); it is picture
+    only otherwise. Sound and picture are lined up as the recording starts, to
+    within a fraction of a second, with no sync correction after. Choose the *Folder* (the Downloads folder if empty), the
     *Codec* (H.264 or H.265), the *Container* (MOV, MKV or MP4) and the
     *Bitrate*; the picture's size is the height set for the send-out, and
     *Record only part of the picture* keeps a rectangle of it (left, top,
@@ -561,7 +565,8 @@ enter, and *Test Mode* downloads its free test media when you start it.
     have only the hardware ones). A display has one send-out, so it can record
     or stream, not both. Checked here with H.264 and H.265 on Windows (AMD
     AMF and software), files read back by FFmpeg at the size asked, a cropped
-    area included; not tried on a Mac, nor with NVENC or Quick Sync.
+    area included, and a tone recorded as sound in MKV and MOV (not yet from
+    a real audio device); not tried on a Mac, nor with NVENC or Quick Sync.
   - *Blackmagic output*: sends the picture to an UltraStudio or DeckLink
     output such as an **Express Monitor** or **Mini Monitor**. These are
     video interfaces, not displays, so they never appear as a second screen;
