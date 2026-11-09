@@ -1492,13 +1492,16 @@ impl Engine {
         if camera::decklink_name(&c.device).is_some() && !camera::decklink_supported() {
             return Err(camera::DECKLINK_UNSUPPORTED.into());
         }
+        let platform = camera::Platform::current();
+        let format =
+            camera::resolve_format(ff, platform, &c.device, c.width, c.height, c.fps, c.format);
         let input = camera::input_args(
-            camera::Platform::current(),
+            platform,
             &c.device,
             c.width,
             c.height,
             c.fps,
-            c.format,
+            format,
             &c.mode_code,
         );
         let matrix = if c.height >= 720 {

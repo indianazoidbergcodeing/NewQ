@@ -518,6 +518,45 @@ pub fn list_modes(
     }
 }
 
+/// The format to ask for at `w` x `h` and `fps` from the modes a device lists:
+/// one it offers at that size and at least that rate, a raw one before a
+/// compressed one. None if it lists no such mode (the request is then left as
+/// it is).
+pub fn auto_format(modes: &[DeviceMode], w: u32, h: u32, fps: u32) -> Option<CaptureFormat> {
+    modes
+        .iter()
+        .filter(|m| m.width == w && m.height == h && (m.fps == 0 || m.fps >= fps))
+        .filter_map(|m| m.format())
+        .min_by_key(|f| f.pixel_format().is_none())
+}
+
+/// What to ask of `device` when the cue says `Automatic`. Some capture cards
+/// (a Magewell USB one, say) refuse to open unless the format is named, so the
+/// device is asked what it offers and the matching format is named. Anything
+/// else (a format already chosen, a device that isn't a DirectShow or
+/// Video4Linux camera, one that won't list its modes) is left as it was.
+pub fn resolve_format(
+    ff: &Ffmpeg,
+    platform: Platform,
+    device: &str,
+    w: u32,
+    h: u32,
+    fps: u32,
+    format: CaptureFormat,
+) -> CaptureFormat {
+    let real = !device.is_empty()
+        && device != TEST_PATTERN_DEVICE
+        && screen_target(device).is_none()
+        && decklink_name(device).is_none();
+    if format != CaptureFormat::Auto || !real || platform == Platform::MacOs {
+        return format;
+    }
+    match list_modes(ff, platform, device) {
+        Ok(modes) => auto_format(&modes, w, h, fps).unwrap_or(format),
+        Err(_) => format,
+    }
+}
+
 /// The devices ffmpeg can open on this machine, by the name `input_args`
 /// wants. The test picture is always first.
 pub fn list_devices(ff: &Ffmpeg) -> Vec<String> {
@@ -753,6 +792,26 @@ mod tests {
             .join(" ")
             .contains("nv12")
         );
+    }
+
+    #[test]
+    fn automatic_names_the_format_a_card_offers_at_the_size() {
+        // A Magewell USB Capture SDI offers YUY2 only, up to 60 fps.
+        let text = "[dshow @ 1]   pixel_format=yuyv422  min s=1920x1080 fps=15 max s=1920x1080 fps=59.9999\n\
+                    [dshow @ 1]   pixel_format=yuyv422  min s=1280x720 fps=15 max s=1280x720 fps=59.9999\n";
+        let modes = parse_dshow_modes(text);
+        assert_eq!(auto_format(&modes, 1280, 720, 30), Some(CaptureFormat::Yuy2));
+        assert_eq!(auto_format(&modes, 1920, 1080, 60), Some(CaptureFormat::Yuy2));
+        // A size or rate it doesn't offer is left alone.
+        assert_eq!(auto_format(&modes, 3840, 2160, 30), None);
+        assert_eq!(auto_format(&modes, 1920, 1080, 120), None);
+        // Raw is preferred to compressed at the same size.
+        let both = parse_dshow_modes(
+            "[dshow @ 1]   vcodec=mjpeg  min s=1280x720 fps=5 max s=1280x720 fps=60\n\
+             [dshow @ 1]   pixel_format=nv12  min s=1280x720 fps=5 max s=1280x720 fps=30\n",
+        );
+        assert_eq!(auto_format(&both, 1280, 720, 30), Some(CaptureFormat::Nv12));
+        assert_eq!(auto_format(&both, 1280, 720, 60), Some(CaptureFormat::Mjpeg));
     }
 
     #[test]
