@@ -4651,6 +4651,7 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                 StreamKind::Udp { .. } => "Network stream (for OBS)",
                 StreamKind::Custom { .. } => "Custom FFmpeg output",
                 StreamKind::Ndi { .. } => "NDI source",
+                StreamKind::DeckLink { .. } => "Blackmagic output (UltraStudio, DeckLink)",
                 StreamKind::Server { .. } => "Streaming server (MediaMTX)",
             };
             egui::Grid::new(("stream_grid", d.id.0))
@@ -4673,6 +4674,10 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                                     name: "NewQ".into(),
                                 },
                                 StreamKind::server(ServerProtocol::Rtsp),
+                                StreamKind::DeckLink {
+                                    device: String::new(),
+                                    size: String::new(),
+                                },
                                 StreamKind::Custom {
                                     args: String::new(),
                                 },
@@ -4723,6 +4728,56 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                         StreamKind::Ndi { name } => {
                             ui.label("Name");
                             ui.add(egui::TextEdit::singleline(name).desired_width(200.0));
+                            ui.end_row();
+                        }
+                        StreamKind::DeckLink { device, size } => {
+                            // The devices are looked for when asked (it runs FFmpeg).
+                            let found_id = egui::Id::new(("decklink_outputs", d.id.0));
+                            ui.label("Device");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(device)
+                                        .hint_text("e.g. UltraStudio Express Monitor")
+                                        .desired_width(200.0),
+                                );
+                                if ui
+                                    .button("Find")
+                                    .on_hover_text("Look for Blackmagic devices that can be sent to")
+                                    .clicked()
+                                {
+                                    let list = engine.decklink_outputs();
+                                    ui.data_mut(|m| m.insert_temp(found_id, list));
+                                }
+                            });
+                            ui.end_row();
+                            if let Some(list) = ui.data(|m| m.get_temp::<Vec<String>>(found_id)) {
+                                ui.label("");
+                                if list.is_empty() {
+                                    ui.label(
+                                        RichText::new(
+                                            "None found: this FFmpeg needs DeckLink support and \
+                                             Blackmagic's Desktop Video installed.",
+                                        )
+                                        .weak()
+                                        .small(),
+                                    );
+                                } else {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for n in &list {
+                                            if ui.small_button(n).clicked() {
+                                                *device = n.clone();
+                                            }
+                                        }
+                                    });
+                                }
+                                ui.end_row();
+                            }
+                            ui.label("Size");
+                            ui.add(
+                                egui::TextEdit::singleline(size)
+                                    .hint_text("display's own size, or e.g. 1920x1080")
+                                    .desired_width(200.0),
+                            );
                             ui.end_row();
                         }
                         StreamKind::Server {
@@ -4907,6 +4962,13 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                             "⚠ The NDI runtime isn't installed on this computer: get the NDI \
                              Runtime or NDI Tools from ndi.video, then restart NewQ."
                         }
+                    }
+                    StreamKind::DeckLink { .. } => {
+                        "Sends the picture (no sound) to a Blackmagic UltraStudio or DeckLink \
+                         output, such as an Express Monitor or Mini Monitor: SDI or HDMI, not a \
+                         display. Needs an FFmpeg built with DeckLink (NewQ's own can't) and \
+                         Blackmagic's Desktop Video. Its size and the frame rate must be one of \
+                         the device's modes, e.g. 1920x1080 at 30 or 60."
                     }
                     StreamKind::Server { .. } => {
                         "Publishes H.264 (picture only) to a streaming server such as MediaMTX, \

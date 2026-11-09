@@ -449,6 +449,93 @@ pub fn parse_has_decklink(devices_text: &str) -> bool {
     })
 }
 
+/// What to tell someone whose FFmpeg can't send to a Blackmagic device.
+pub const DECKLINK_OUTPUT_UNSUPPORTED: &str = "This FFmpeg can't send to Blackmagic (DeckLink) devices. NewQ's own FFmpeg can't, because \
+     Blackmagic's SDK terms don't let it be shipped. Use an FFmpeg built with --enable-decklink \
+     (and Blackmagic's Desktop Video installed) by putting it in the folder named by NEWQ_FFMPEG_DIR.";
+
+/// Whether a listing from `ffmpeg -devices` has the `decklink` output (a line
+/// like ` E decklink  Blackmagic DeckLink output`).
+pub fn parse_has_decklink_output(devices_text: &str) -> bool {
+    devices_text.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        let flags = w.next().unwrap_or("");
+        flags.contains('E') && w.next() == Some("decklink")
+    })
+}
+
+/// Whether `ff` can send to a Blackmagic device.
+pub fn ffmpeg_has_decklink_output(ff: &Ffmpeg) -> bool {
+    let mut cmd = ff.command();
+    cmd.args(["-hide_banner", "-devices"]);
+    cmd.output()
+        .map(|o| parse_has_decklink_output(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false)
+}
+
+/// The Blackmagic devices that can be sent to, by name, from `ffmpeg -sinks
+/// decklink` (lines like `  UltraStudio Express Monitor [UltraStudio Express
+/// Monitor]` under "Auto-detected sinks for decklink:") and, for an FFmpeg
+/// that lists them there, the "output devices" part of `-list_devices`.
+pub fn parse_decklink_outputs(sinks_text: &str, list_text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |name: &str| {
+        let name = name.trim().trim_start_matches('*').trim();
+        if !name.is_empty() && !found.iter().any(|f| f == name) {
+            found.push(name.to_string());
+        }
+    };
+    let mut in_sinks = false;
+    for line in sinks_text.lines() {
+        if line.contains("Auto-detected sinks") {
+            in_sinks = true;
+            continue;
+        }
+        if in_sinks && (line.starts_with(char::is_whitespace) || line.starts_with('*')) {
+            let name = line.split_once(" [").map_or(line, |(n, _)| n);
+            add(name);
+        }
+    }
+    let mut in_output = false;
+    for line in list_text.lines() {
+        if line.contains("DeckLink output devices") {
+            in_output = true;
+            continue;
+        }
+        if line.contains("DeckLink input devices") {
+            in_output = false;
+            continue;
+        }
+        if !in_output {
+            continue;
+        }
+        if let Some(start) = line.find('\'')
+            && let Some(len) = line[start + 1..].rfind('\'')
+        {
+            add(&line[start + 1..start + 1 + len]);
+        }
+    }
+    found
+}
+
+/// The Blackmagic devices `ff` can send to (none if its build lacks DeckLink).
+pub fn list_decklink_outputs(ff: &Ffmpeg) -> Vec<String> {
+    if !ffmpeg_has_decklink_output(ff) {
+        return Vec::new();
+    }
+    let mut sinks = ff.command();
+    sinks.args(["-hide_banner", "-sinks", "decklink"]);
+    let sinks = sinks
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).into_owned()
+                + &String::from_utf8_lossy(&o.stderr)
+        })
+        .unwrap_or_default();
+    let list = list_output(ff, &["-f", "decklink", "-list_devices", "1", "-i", "dummy"]);
+    parse_decklink_outputs(&sinks, &list)
+}
+
 /// Ask `ff` what modes `device` offers: each system's own listing, which
 /// FFmpeg prints as a side effect (AVFoundation only when asked for a mode it
 /// hasn't got, so a size of 1 x 1 is asked for). A device that is in use may
@@ -944,6 +1031,25 @@ Game Capture 4K S:none: Immediate exit requested
             Some("UltraStudio 4K")
         );
         assert_eq!(decklink_name("Integrated Camera"), None);
+    }
+
+    #[test]
+    fn reads_the_blackmagic_devices_that_can_be_sent_to() {
+        let sinks = "Auto-detected sinks for decklink:\n  UltraStudio Express Monitor [UltraStudio Express Monitor]\n* UltraStudio Mini Monitor [UltraStudio Mini Monitor]\n";
+        let list = "\
+[decklink @ 0x1] Blackmagic DeckLink output devices:
+[decklink @ 0x1] \t'UltraStudio Mini Monitor'
+[decklink @ 0x1] \t'DeckLink Duo (2)'
+[decklink @ 0x1] Blackmagic DeckLink input devices:
+[decklink @ 0x1] \t'UltraStudio Express Recorder'
+";
+        assert_eq!(
+            parse_decklink_outputs(sinks, list),
+            vec!["UltraStudio Express Monitor", "UltraStudio Mini Monitor", "DeckLink Duo (2)"]
+        );
+        assert!(parse_decklink_outputs("", "").is_empty());
+        assert!(parse_has_decklink_output(" E decklink         Blackmagic DeckLink output\n"));
+        assert!(!parse_has_decklink_output(" D  decklink         Blackmagic DeckLink input\n"));
     }
 
     #[test]

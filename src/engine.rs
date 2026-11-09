@@ -697,6 +697,15 @@ impl Engine {
         &self.cameras
     }
 
+    /// The Blackmagic devices this FFmpeg can send to. It runs FFmpeg and waits
+    /// for it (a moment), so it is for a button press, not every frame.
+    pub fn decklink_outputs(&self) -> Vec<String> {
+        self.ff
+            .as_ref()
+            .map(camera::list_decklink_outputs)
+            .unwrap_or_default()
+    }
+
     /// Ask `device` what modes it offers, on a background thread (it takes a
     /// second or two). The answer is `camera_modes`.
     pub fn query_camera_modes(&mut self, device: &str) {
