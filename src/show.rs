@@ -623,6 +623,9 @@ pub enum StreamKind {
         /// None records the whole picture.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         area: Option<RecordArea>,
+        /// Sound to record with it: None records the picture alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio: Option<RecordAudio>,
     },
     /// A Blackmagic output (an UltraStudio Express Monitor or Mini Monitor, a
     /// DeckLink card): SDI or HDMI, not a display of the computer. FFmpeg
@@ -749,6 +752,18 @@ impl RecordArea {
             h: self.h.clamp(0.01, 1.0 - y),
         }
     }
+}
+
+/// Which sound goes into a recording: a copy of what one of the show's audio
+/// outputs plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordAudio {
+    /// The show's audio output; None is the one cues use when they choose none.
+    #[serde(default)]
+    pub output: Option<AudioOutputId>,
+    /// The first of the two channels of that device that are recorded, from 0.
+    #[serde(default)]
+    pub channel: u16,
 }
 
 fn default_record_kbps() -> u32 {

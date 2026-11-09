@@ -147,6 +147,8 @@ struct Device {
     lost: Arc<Lost>,
     /// How hard the mixing works and how loud each channel is.
     stats: Arc<Stats>,
+    /// Where a recording takes a copy of what is played.
+    tap: TapSlot,
 }
 
 /// What the device's callback reports: the mixing load (the time it takes of
@@ -179,7 +181,8 @@ impl Device {
         let (voices_tx, voices_rx) = unbounded();
         let lost = Arc::new(Lost::default());
         let stats = Arc::new(Stats::default());
-        match open_stream(name, voices_rx, lost.clone(), stats.clone()) {
+        let tap = TapSlot::default();
+        match open_stream(name, voices_rx, lost.clone(), stats.clone(), tap.clone()) {
             Ok((stream, sample_rate, channels, device)) => Device {
                 _stream: Some(stream),
                 open: true,
@@ -190,6 +193,7 @@ impl Device {
                 voices_tx,
                 lost,
                 stats,
+                tap,
             },
             Err(e) => {
                 if earlier != Some(format!("{e:#}").as_str()) {
@@ -205,6 +209,7 @@ impl Device {
                     voices_tx,
                     lost,
                     stats,
+                    tap,
                 }
             }
         }
@@ -226,8 +231,81 @@ impl Device {
             voices_tx,
             lost: Arc::new(Lost::default()),
             stats: Arc::new(Stats::default()),
+            tap: TapSlot::default(),
         };
         (device, voices_rx)
+    }
+}
+
+
+/// Where a recording takes a copy of the sound a device plays: stereo,
+/// from a pair of the device's channels, into a ring that the recording
+/// reads. The audio callback only ever `try_lock`s it, so a recording can
+/// never hold the sound up.
+#[derive(Clone, Default)]
+struct TapSlot(Arc<Mutex<Option<TapIn>>>);
+
+struct TapIn {
+    producer: rtrb::Producer<f32>,
+    /// The first of the two device channels that are copied.
+    first: usize,
+}
+
+impl TapSlot {
+    /// Copy `mix` (interleaved, `channels` wide, played at `master`).
+    fn push(&self, mix: &[f32], channels: usize, master: f32) {
+        let Some(mut guard) = self.0.try_lock() else {
+            return;
+        };
+        let Some(tap) = guard.as_mut() else { return };
+        if tap.producer.is_abandoned() {
+            *guard = None;
+            return;
+        }
+        for frame in mix.chunks_exact(channels.max(1)) {
+            let l = frame.get(tap.first).copied().unwrap_or(0.0);
+            // A one-channel device is heard on both sides.
+            let r = frame.get(tap.first + 1).copied().unwrap_or(l) * master;
+            let l = l * master;
+            // A full ring drops the sound rather than wait: the recording is
+            // not keeping up, and the show must not stop for it.
+            if tap.producer.slots() < 2 {
+                break;
+            }
+            let _ = tap.producer.push(l.clamp(-1.0, 1.0));
+            let _ = tap.producer.push(r.clamp(-1.0, 1.0));
+        }
+    }
+}
+
+/// A copy of what an audio output plays, as interleaved stereo `f32`s. It
+/// stops when dropped.
+pub struct AudioTap {
+    pub consumer: rtrb::Consumer<f32>,
+    pub sample_rate: u32,
+    slot: TapSlot,
+}
+
+
+#[cfg(test)]
+impl AudioTap {
+    /// A tap that is fed by the test: the way in, and the tap.
+    pub fn for_test(sample_rate: u32) -> (rtrb::Producer<f32>, AudioTap) {
+        let (producer, consumer) = rtrb::RingBuffer::new(sample_rate as usize * 4);
+        (
+            producer,
+            AudioTap {
+                consumer,
+                sample_rate,
+                slot: TapSlot::default(),
+            },
+        )
+    }
+}
+
+impl Drop for AudioTap {
+    fn drop(&mut self) {
+        *self.slot.0.lock() = None;
     }
 }
 
@@ -385,6 +463,26 @@ impl AudioOut {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Start copying what `output` (None = the default) plays, channels
+    /// `first` and the next, for a recording. One recording per device: a
+    /// second one takes over.
+    pub fn tap(&self, output: Option<AudioOutputId>, first: u16) -> Result<AudioTap, String> {
+        let Some(d) = self.device_for(output).filter(|d| d.open) else {
+            return Err("that audio output isn't open".into());
+        };
+        let (producer, consumer) =
+            rtrb::RingBuffer::new(d.sample_rate as usize * 2 * 2);
+        *d.tap.0.lock() = Some(TapIn {
+            producer,
+            first: usize::from(first).min(usize::from(d.channels.saturating_sub(1))),
+        });
+        Ok(AudioTap {
+            consumer,
+            sample_rate: d.sample_rate,
+            slot: d.tap.clone(),
+        })
     }
 
     pub fn device_status(&self, output: Option<AudioOutputId>) -> Option<DeviceStatus> {
@@ -1223,6 +1321,7 @@ fn open_stream(
     voices_rx: Receiver<MixVoice>,
     lost: Arc<Lost>,
     stats: Arc<Stats>,
+    tap: TapSlot,
 ) -> Result<(cpal::Stream, u32, u16, String)> {
     let device = find_device(name)?;
     let mut device_name = device
@@ -1241,10 +1340,10 @@ fn open_stream(
     let config = supported.config();
     let (sr, channels) = (config.sample_rate, config.channels);
     let stream = match format {
-        cpal::SampleFormat::F32 => build::<f32>(&device, config, voices_rx, master, lost, stats)?,
-        cpal::SampleFormat::I16 => build::<i16>(&device, config, voices_rx, master, lost, stats)?,
-        cpal::SampleFormat::U16 => build::<u16>(&device, config, voices_rx, master, lost, stats)?,
-        cpal::SampleFormat::I32 => build::<i32>(&device, config, voices_rx, master, lost, stats)?,
+        cpal::SampleFormat::F32 => build::<f32>(&device, config, voices_rx, master, lost, stats, tap)?,
+        cpal::SampleFormat::I16 => build::<i16>(&device, config, voices_rx, master, lost, stats, tap)?,
+        cpal::SampleFormat::U16 => build::<u16>(&device, config, voices_rx, master, lost, stats, tap)?,
+        cpal::SampleFormat::I32 => build::<i32>(&device, config, voices_rx, master, lost, stats, tap)?,
         other => return Err(anyhow!("unsupported sample format {other:?}")),
     };
     stream.play()?;
@@ -1258,6 +1357,7 @@ fn build<T>(
     master: f32,
     lost: Arc<Lost>,
     stats: Arc<Stats>,
+    tap: TapSlot,
 ) -> Result<cpal::Stream>
 where
     T: SizedSample + FromSample<f32>,
@@ -1297,6 +1397,7 @@ where
             for (s, m) in out.iter_mut().zip(&mix) {
                 *s = T::from_sample((m * master).clamp(-1.0, 1.0));
             }
+            tap.push(&mix, channels, master);
             let used = began.elapsed().as_secs_f32() / (frames as f32 / rate).max(1e-6);
             worst = used.max(worst * 0.99);
             stats.load.store((worst * 1000.0) as u32, Ordering::Relaxed);
@@ -1472,6 +1573,46 @@ fn mix_voice(v: &mut MixVoice, mix: &mut [f32], frames: usize, channels: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recording_taps_the_device_an_output_plays_on_and_lets_go_when_done() {
+        // Nothing open: nothing to record.
+        assert!(AudioOut::disabled().tap(None, 0).is_err());
+        let (out, _) = AudioOut::with_working_device();
+        let tap = out.tap(None, 0).expect("the default device is open");
+        assert_eq!(tap.sample_rate, 48_000);
+        let device = out.devices.get(&None).unwrap();
+        assert!(device.tap.0.lock().is_some());
+        drop(tap);
+        assert!(device.tap.0.lock().is_none());
+    }
+
+    #[test]
+    fn a_recordings_copy_of_the_sound_is_a_pair_of_channels_at_the_volume_heard() {
+        let slot = TapSlot::default();
+        let (producer, mut consumer) = rtrb::RingBuffer::new(64);
+        *slot.0.lock() = Some(TapIn { producer, first: 1 });
+        // Two frames of a four-channel mix, heard at half volume.
+        let mix = [0.0, 0.4, -0.6, 0.0, 0.0, 1.0, 1.0, 0.0];
+        slot.push(&mix, 4, 0.5);
+        let got: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(got, vec![0.2, -0.3, 0.5, 0.5]);
+        // A one-channel device is heard on both sides.
+        let (producer, mut consumer) = rtrb::RingBuffer::new(8);
+        *slot.0.lock() = Some(TapIn { producer, first: 0 });
+        slot.push(&[0.25], 1, 1.0);
+        let got: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+        assert_eq!(got, vec![0.25, 0.25]);
+        // A full ring drops sound rather than wait, and a recording that has
+        // gone takes the tap with it.
+        let (producer, consumer) = rtrb::RingBuffer::new(2);
+        *slot.0.lock() = Some(TapIn { producer, first: 0 });
+        slot.push(&[0.1, 0.1, 0.1, 0.1], 2, 1.0);
+        drop(consumer);
+        slot.push(&[0.1, 0.1], 2, 1.0);
+        assert!(slot.0.lock().is_none());
+    }
+
 
     #[test]
     fn a_frame_is_routed_to_the_chosen_channels() {

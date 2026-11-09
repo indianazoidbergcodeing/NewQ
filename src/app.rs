@@ -1537,15 +1537,29 @@ impl App {
                 fail(self, "FFmpeg was not found".into());
                 continue;
             };
+            // A recording with sound takes a copy of what its audio output plays.
+            let audio = match &config.kind {
+                crate::show::StreamKind::Record {
+                    audio: Some(a), ..
+                } => match self.engine.audio.tap(a.output, a.channel) {
+                    Ok(tap) => Some(tap),
+                    Err(why) => {
+                        fail(self, format!("no sound to record: {why}"));
+                        continue;
+                    }
+                },
+                _ => None,
+            };
             // FFmpeg is started on the stream's own thread, so neither
             // looking for what it can encode nor starting it holds up the show.
-            let thread = CaptureThread::spawn(
+            let thread = CaptureThread::spawn_with_audio(
                 gpu.clone(),
                 gpu::Slot::Capture(slot),
                 *size,
                 config.fps,
                 ff,
                 config.kind.clone(),
+                audio,
             );
             self.engine.log(format!(
                 "Sending {name} out: {}×{} at {} fps",
