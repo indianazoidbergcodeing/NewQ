@@ -245,6 +245,21 @@ enter, and *Test Mode* downloads its free test media when you start it.
   repository has the secrets `WINDOWS_CERT_PFX` (the certificate as base64) and
   `WINDOWS_CERT_PASSWORD`; a new certificate still shows the warning until
   it builds reputation, unless it is an EV certificate.
+- **New interface (optional):** *Window ▸ New interface* swaps the panes for three
+  views under one strip (the strip has GO and what it will fire, Stop all,
+  Pause and *Lock editing*, which is show mode; *Classic interface* switches back).
+  The same show and settings, kept per computer, and nothing in the show file
+  changes. *Editor* is the cue list with the inspector under it and what is
+  playing beside it. *Operator* is for running a show: the next cue large, a big
+  GO, the cues after it, what is running with the time left (with Fade out and
+  Stop), the picture of the display, and lights for FFmpeg, the audio output,
+  each display's monitor and each audio device. *Patch* draws cues, displays
+  and audio outputs and the gear they reach (the monitor and any stream or
+  recording of a display, the audio device with its level); drag from the dot on
+  a cue to a display (a picture) or an audio output (its sound) to route it, and
+  click a cue to select it. *Settings* opens in place of the view. Routes
+  can't be changed in show mode. Checked by drawing every view in tests and a
+  test that drags routes, and by eye on Windows; not on a Mac or Linux.
 - **Panes you can rearrange and pop out:** the main window is a set of panes
   (*Cue list*, *Inspector*, *Preview*, *Active*, the *Cart* and the *Settings*)
   that tile it: drag a pane's tab onto another to move it, beside or above or

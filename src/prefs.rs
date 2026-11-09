@@ -50,6 +50,9 @@ pub struct Prefs {
     /// Test Mode runs with the sound off (everything still mixed).
     #[serde(default, skip_serializing_if = "is_false")]
     pub test_muted: bool,
+    /// The new interface (editor, operator and patch views) in place of the panes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub new_layout: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -101,6 +104,7 @@ mod tests {
             clicker_on: true,
             clicker_go: Some(0x51),
             clicker_back: Some(0x49),
+            new_layout: true,
         };
         p.save(&dir).unwrap();
         assert_eq!(Prefs::load(&dir), p);
@@ -112,6 +116,7 @@ mod tests {
         // Defaults are not written, so older versions read the file as before.
         let json = serde_json::to_string(&Prefs::default()).unwrap();
         assert!(!json.contains("test_"), "{json}");
+        assert!(!json.contains("new_layout"), "{json}");
         assert!(
             !json.contains("let_computer_sleep") && !json.contains("fps_on_output"),
             "{json}"

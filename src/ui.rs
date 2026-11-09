@@ -1,5 +1,6 @@
 //! The control window UI: transport, cue list, inspector, active cues and outputs.
 
+mod modern;
 mod settings;
 
 use crate::clicker::{BACK_GUARD, Button, Do};
@@ -215,6 +216,8 @@ pub use crate::mediamtx::Status as HostingStatus;
 
 #[derive(Default)]
 pub struct UiState {
+    /// Which arrangement of the new interface is showing.
+    pub modern_view: modern::View,
     /// The streaming server NewQ runs for "Run the server in NewQ".
     pub hosting: HostingStatus,
     /// Set by ticking "Run the server in NewQ" (or its Allow button): this
@@ -578,6 +581,8 @@ enum Action {
     OpenSettings(SettingsPage),
     CloseSettings,
     ToggleSettings,
+    /// Switch between the panes and the new interface (kept for this computer).
+    SetNewLayout(bool),
     ToggleAbout,
     ToggleTestMode,
     ToggleStats,
@@ -810,11 +815,18 @@ pub fn draw(ui: &mut Ui, show: &mut Show, engine: &mut Engine, st: &mut UiState)
         st.json_stale = true;
     }
     egui::Panel::top("menu").show(ui, |ui| menu_bar(ui, show, st, &mut actions));
-    egui::Panel::top("transport")
-        .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(10))
-        .show(ui, |ui| transport(ui, show, engine, st, &mut actions));
+    let modern = st.prefs.new_layout;
+    if !modern {
+        egui::Panel::top("transport")
+            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(10))
+            .show(ui, |ui| transport(ui, show, engine, st, &mut actions));
+    }
     egui::Panel::bottom("status").show(ui, |ui| status_bar(ui, show, engine, st));
-    dock_area(ui, show, engine, st, &mut actions);
+    if modern {
+        modern::draw(ui, show, engine, st, &mut actions);
+    } else {
+        dock_area(ui, show, engine, st, &mut actions);
+    }
     media_window(ui.ctx(), show, st, &mut actions);
     about_window(ui.ctx(), st);
     crate::testmode::gui::window(ui.ctx(), engine, st);
@@ -1305,6 +1317,19 @@ fn end_preview_edits(st: &mut UiState) {
 /// The Window menu: which panes are showing, and which are in a window of
 /// their own.
 fn window_menu(ui: &mut Ui, st: &UiState, actions: &mut Vec<Action>) {
+    let mut modern = st.prefs.new_layout;
+    if ui
+        .checkbox(&mut modern, "New interface")
+        .on_hover_text(
+            "Editor, Operator and Patch views in place of the panes. The same show; \
+             switch back any time.",
+        )
+        .changed()
+    {
+        actions.push(Action::SetNewLayout(modern));
+        ui.close();
+    }
+    ui.separator();
     let mut stats = st.stats_open;
     if ui
         .checkbox(&mut stats, "Statistics")
@@ -9792,6 +9817,14 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
             st.settings_page = page;
         }
         Action::CloseSettings => close_settings(st),
+        Action::SetNewLayout(on) => {
+            st.prefs.new_layout = on;
+            if let Some(dir) = &st.layout_dir
+                && let Err(e) = st.prefs.save(dir)
+            {
+                log::warn!("could not save the settings of this computer: {e}");
+            }
+        }
         Action::ToggleSettings => {
             if st.settings_open() {
                 close_settings(st);
