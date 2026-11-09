@@ -528,8 +528,7 @@ pub fn list_decklink_outputs(ff: &Ffmpeg) -> Vec<String> {
     let sinks = sinks
         .output()
         .map(|o| {
-            String::from_utf8_lossy(&o.stdout).into_owned()
-                + &String::from_utf8_lossy(&o.stderr)
+            String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
         })
         .unwrap_or_default();
     let list = list_output(ff, &["-f", "decklink", "-list_devices", "1", "-i", "dummy"]);
@@ -638,10 +637,61 @@ pub fn resolve_format(
     if format != CaptureFormat::Auto || !real || platform == Platform::MacOs {
         return format;
     }
-    match list_modes(ff, platform, device) {
-        Ok(modes) => auto_format(&modes, w, h, fps).unwrap_or(format),
-        Err(_) => format,
+    match modes_of(ff, platform, device) {
+        Some(modes) => auto_format(&modes, w, h, fps).unwrap_or(format),
+        None => format,
     }
+}
+
+/// What a device offered when last asked: when, and the modes (None if it
+/// wouldn't say, or the asking is still going).
+type ModeCache = std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, Option<Vec<DeviceMode>>)>,
+>;
+
+/// How long a list of modes is kept, and how long a failure to get one is
+/// (a device in use by another program answers later).
+const MODES_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
+const MODES_FAILED_KEPT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The longest GO waits to be told: asking a device runs FFmpeg, and a driver
+/// that hangs must not hang the show. The answer is kept for the next GO.
+const MODES_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The modes `device` offers, asked once and kept (see `MODES_WAIT`).
+fn modes_of(ff: &Ffmpeg, platform: Platform, device: &str) -> Option<Vec<DeviceMode>> {
+    static CACHE: std::sync::OnceLock<ModeCache> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    {
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, modes)) = c.get(device) {
+            let kept = if modes.is_some() {
+                MODES_KEPT
+            } else {
+                MODES_FAILED_KEPT
+            };
+            if at.elapsed() < kept {
+                return modes.clone();
+            }
+        }
+        // Marked as asked at once, so a slow answer is not asked for again.
+        c.insert(device.to_string(), (std::time::Instant::now(), None));
+    }
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let (ff, key) = (ff.clone(), device.to_string());
+    let started = std::thread::Builder::new()
+        .name("camera-format".into())
+        .spawn(move || {
+            let modes = list_modes(&ff, platform, &key).ok();
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (std::time::Instant::now(), modes.clone()));
+            let _ = tx.send(modes);
+        });
+    if started.is_err() {
+        return None;
+    }
+    rx.recv_timeout(MODES_WAIT).ok().flatten()
 }
 
 /// The devices ffmpeg can open on this machine, by the name `input_args`
@@ -887,8 +937,14 @@ mod tests {
         let text = "[dshow @ 1]   pixel_format=yuyv422  min s=1920x1080 fps=15 max s=1920x1080 fps=59.9999\n\
                     [dshow @ 1]   pixel_format=yuyv422  min s=1280x720 fps=15 max s=1280x720 fps=59.9999\n";
         let modes = parse_dshow_modes(text);
-        assert_eq!(auto_format(&modes, 1280, 720, 30), Some(CaptureFormat::Yuy2));
-        assert_eq!(auto_format(&modes, 1920, 1080, 60), Some(CaptureFormat::Yuy2));
+        assert_eq!(
+            auto_format(&modes, 1280, 720, 30),
+            Some(CaptureFormat::Yuy2)
+        );
+        assert_eq!(
+            auto_format(&modes, 1920, 1080, 60),
+            Some(CaptureFormat::Yuy2)
+        );
         // A size or rate it doesn't offer is left alone.
         assert_eq!(auto_format(&modes, 3840, 2160, 30), None);
         assert_eq!(auto_format(&modes, 1920, 1080, 120), None);
@@ -898,7 +954,10 @@ mod tests {
              [dshow @ 1]   pixel_format=nv12  min s=1280x720 fps=5 max s=1280x720 fps=30\n",
         );
         assert_eq!(auto_format(&both, 1280, 720, 30), Some(CaptureFormat::Nv12));
-        assert_eq!(auto_format(&both, 1280, 720, 60), Some(CaptureFormat::Mjpeg));
+        assert_eq!(
+            auto_format(&both, 1280, 720, 60),
+            Some(CaptureFormat::Mjpeg)
+        );
     }
 
     #[test]
@@ -1045,11 +1104,19 @@ Game Capture 4K S:none: Immediate exit requested
 ";
         assert_eq!(
             parse_decklink_outputs(sinks, list),
-            vec!["UltraStudio Express Monitor", "UltraStudio Mini Monitor", "DeckLink Duo (2)"]
+            vec![
+                "UltraStudio Express Monitor",
+                "UltraStudio Mini Monitor",
+                "DeckLink Duo (2)"
+            ]
         );
         assert!(parse_decklink_outputs("", "").is_empty());
-        assert!(parse_has_decklink_output(" E decklink         Blackmagic DeckLink output\n"));
-        assert!(!parse_has_decklink_output(" D  decklink         Blackmagic DeckLink input\n"));
+        assert!(parse_has_decklink_output(
+            " E decklink         Blackmagic DeckLink output\n"
+        ));
+        assert!(!parse_has_decklink_output(
+            " D  decklink         Blackmagic DeckLink input\n"
+        ));
     }
 
     #[test]

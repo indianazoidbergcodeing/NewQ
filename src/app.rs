@@ -1539,15 +1539,15 @@ impl App {
             };
             // A recording with sound takes a copy of what its audio output plays.
             let audio = match &config.kind {
-                crate::show::StreamKind::Record {
-                    audio: Some(a), ..
-                } => match self.engine.audio.tap(a.output, a.channel) {
-                    Ok(tap) => Some(tap),
-                    Err(why) => {
-                        fail(self, format!("no sound to record: {why}"));
-                        continue;
+                crate::show::StreamKind::Record { audio: Some(a), .. } => {
+                    match self.engine.audio.tap(a.output, a.channel) {
+                        Ok(tap) => Some(tap),
+                        Err(why) => {
+                            fail(self, format!("no sound to record: {why}"));
+                            continue;
+                        }
                     }
-                },
+                }
                 _ => None,
             };
             // FFmpeg is started on the stream's own thread, so neither
@@ -2793,6 +2793,22 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Let every stream finish what it has been given, so a recording's file
+        // is closed (a MOV or MP4 cut off before that cannot be played). Each
+        // is bounded (`CaptureThread::stop`), and they stop together.
+        let stops: Vec<_> = self
+            .streams
+            .drain()
+            .filter_map(|(_, r)| {
+                std::thread::Builder::new()
+                    .name("stream-stop".into())
+                    .spawn(move || r.thread.stop())
+                    .ok()
+            })
+            .collect();
+        for s in stops {
+            let _ = s.join();
+        }
         // The streaming server NewQ runs goes with it.
         self.hosting_runner = None;
         self.engine.stop_all(0.0);

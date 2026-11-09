@@ -697,13 +697,21 @@ impl Engine {
         &self.cameras
     }
 
-    /// The Blackmagic devices this FFmpeg can send to. It runs FFmpeg and waits
-    /// for it (a moment), so it is for a button press, not every frame.
-    pub fn decklink_outputs(&self) -> Vec<String> {
-        self.ff
-            .as_ref()
-            .map(camera::list_decklink_outputs)
-            .unwrap_or_default()
+    /// The Blackmagic devices this FFmpeg can send to, found on a thread (it runs
+    /// FFmpeg, which can take a while): the answer arrives on the channel.
+    pub fn decklink_outputs_later(&self) -> crossbeam_channel::Receiver<Vec<String>> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let ff = self.ff.clone();
+        let _ = std::thread::Builder::new()
+            .name("decklink-outputs".into())
+            .spawn(move || {
+                let list = ff
+                    .as_ref()
+                    .map(camera::list_decklink_outputs)
+                    .unwrap_or_default();
+                let _ = tx.send(list);
+            });
+        rx
     }
 
     /// Ask `device` what modes it offers, on a background thread (it takes a
