@@ -299,6 +299,28 @@ pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Ve
             Ok(a)
         }
         StreamKind::Ndi { .. } => Err("an NDI source is sent by NewQ itself, not FFmpeg".into()),
+        StreamKind::DeckLink { device, size } => {
+            let device = device.trim();
+            if device.is_empty() {
+                return Err("no Blackmagic output chosen".into());
+            }
+            // The device wants UYVY, and a size and rate that are one of its
+            // modes; a size is asked for here so FFmpeg scales to it.
+            let mut a = list(&["-pix_fmt", "uyvy422"]);
+            let size = size.trim();
+            if !size.is_empty() {
+                let ok = size.split_once('x').is_some_and(|(w, h)| {
+                    w.parse::<u32>().is_ok_and(|w| w > 0) && h.parse::<u32>().is_ok_and(|h| h > 0)
+                });
+                if !ok {
+                    return Err(format!("\"{size}\" isn't a size like 1920x1080"));
+                }
+                a.extend(list(&["-s", size]));
+            }
+            a.extend(list(&["-f", "decklink"]));
+            a.push(device.to_string());
+            Ok(a)
+        }
         StreamKind::Custom { args } => {
             let a = split_args(args);
             if a.is_empty() {
@@ -576,6 +598,11 @@ impl Sink {
             {
                 return Err(why);
             }
+            if matches!(kind, StreamKind::DeckLink { .. })
+                && !crate::media::camera::ffmpeg_has_decklink_output(ff)
+            {
+                return Err(crate::media::camera::DECKLINK_OUTPUT_UNSUPPORTED.into());
+            }
             // An encoder the user chose is used as it is; otherwise the first
             // that works.
             let chosen = match kind {
@@ -747,6 +774,27 @@ mod tests {
             line,
             "-f rawvideo -pix_fmt rgba -s 1280x720 -framerate 30 -i pipe:0"
         );
+    }
+
+    #[test]
+    fn a_blackmagic_output_is_sent_as_uyvy_to_the_device() {
+        let k = |device: &str, size: &str| StreamKind::DeckLink {
+            device: device.into(),
+            size: size.into(),
+        };
+        let a = output_args(&k(" UltraStudio Express Monitor ", ""), None, 30).unwrap();
+        assert_eq!(
+            a,
+            ["-pix_fmt", "uyvy422", "-f", "decklink", "UltraStudio Express Monitor"]
+        );
+        let b = output_args(&k("Mini Monitor", "1920x1080"), None, 60).unwrap();
+        assert_eq!(
+            b,
+            ["-pix_fmt", "uyvy422", "-s", "1920x1080", "-f", "decklink", "Mini Monitor"]
+        );
+        assert!(output_args(&k("", ""), None, 30).is_err());
+        assert!(output_args(&k("Mini Monitor", "big"), None, 30).is_err());
+        assert!(output_args(&k("Mini Monitor", "0x1080"), None, 30).is_err());
     }
 
     #[test]

@@ -603,6 +603,16 @@ pub enum StreamKind {
     Custom { args: String },
     /// An NDI source of this name on the network (needs NDI's runtime).
     Ndi { name: String },
+    /// A Blackmagic output (an UltraStudio Express Monitor or Mini Monitor, a
+    /// DeckLink card): SDI or HDMI, not a display of the computer. FFmpeg
+    /// reaches it with its `decklink` output, which only some builds have.
+    /// `size` (`1920x1080`) scales the picture to a mode the device has; empty
+    /// sends the display's own size.
+    DeckLink {
+        device: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        size: String,
+    },
     /// Publishing to a streaming server such as MediaMTX, which then serves the
     /// picture to any number of viewers (RTSP, RTMP or SRT). H.264, picture only.
     Server {

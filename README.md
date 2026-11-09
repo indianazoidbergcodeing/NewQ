@@ -548,6 +548,19 @@ enter, and *Test Mode* downloads its free test media when you start it.
     bundled MediaMTX (a viewer joining late, five viewers over RTSP, RTMP and HLS for
     three minutes with flat memory); **not tried on a Mac, nor with NVENC or Quick Sync,
     nor a phone scanning the code**.
+  - *Blackmagic output*: sends the picture to an UltraStudio or DeckLink
+    output such as an **Express Monitor** or **Mini Monitor**. These are
+    video interfaces, not displays, so they never appear as a second screen;
+    NewQ sends the picture to the device itself (SDI or HDMI), as other show
+    software does. Like Blackmagic input it goes through FFmpeg's `decklink`
+    output, which NewQ's own FFmpeg doesn't have (Blackmagic's SDK terms), so
+    it needs an FFmpeg built with `--enable-decklink` in the folder named by
+    `NEWQ_FFMPEG_DIR`, and Blackmagic's Desktop Video installed. *Find* lists
+    the devices; give a size (e.g. `1920x1080`) if the display's own size
+    isn't one the device has, and the display's frame rate must also be one of
+    its modes. Picture only, no sound. The Mini Recorder and Express Recorder
+    are inputs, and use the Blackmagic camera support above. **Written from
+    FFmpeg's documented output and not tried with any Blackmagic hardware.**
   - *Custom FFmpeg output*: the arguments that follow the input (the picture
     arrives as raw RGBA), for anything else FFmpeg can send to: a streaming
     service, a file.
