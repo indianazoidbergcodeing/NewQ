@@ -4652,6 +4652,7 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                 StreamKind::Custom { .. } => "Custom FFmpeg output",
                 StreamKind::Ndi { .. } => "NDI source",
                 StreamKind::DeckLink { .. } => "Blackmagic output (UltraStudio, DeckLink)",
+                StreamKind::Record { .. } => "Record to a file",
                 StreamKind::Server { .. } => "Streaming server (MediaMTX)",
             };
             egui::Grid::new(("stream_grid", d.id.0))
@@ -4677,6 +4678,13 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                                 StreamKind::DeckLink {
                                     device: String::new(),
                                     size: String::new(),
+                                },
+                                StreamKind::Record {
+                                    folder: String::new(),
+                                    codec: Default::default(),
+                                    container: Default::default(),
+                                    kbps: 16_000,
+                                    area: None,
                                 },
                                 StreamKind::Custom {
                                     args: String::new(),
@@ -4728,6 +4736,88 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                         StreamKind::Ndi { name } => {
                             ui.label("Name");
                             ui.add(egui::TextEdit::singleline(name).desired_width(200.0));
+                            ui.end_row();
+                        }
+                        StreamKind::Record {
+                            folder,
+                            codec,
+                            container,
+                            kbps,
+                            area,
+                        } => {
+                            ui.label("Folder");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(folder)
+                                        .hint_text(
+                                            crate::stream::default_record_folder()
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                        )
+                                        .desired_width(200.0),
+                                );
+                                if ui.button("Browse…").clicked()
+                                    && let Some(p) = rfd::FileDialog::new()
+                                        .set_title("Record into…")
+                                        .pick_folder()
+                                {
+                                    *folder = p.to_string_lossy().into_owned();
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Codec");
+                            ui.horizontal(|ui| {
+                                for c in crate::show::RecordCodec::ALL {
+                                    ui.selectable_value(codec, c, c.label());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Container");
+                            ui.horizontal(|ui| {
+                                for c in crate::show::RecordContainer::ALL {
+                                    ui.selectable_value(container, c, c.label());
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Bitrate");
+                            ui.add(
+                                egui::DragValue::new(kbps)
+                                    .range(200..=200_000)
+                                    .speed(100.0)
+                                    .suffix(" kbps"),
+                            );
+                            ui.end_row();
+                            ui.label("Area");
+                            ui.vertical(|ui| {
+                                let mut part = area.is_some();
+                                if ui.checkbox(&mut part, "Record only part of the picture").changed() {
+                                    *area = part.then(crate::show::RecordArea::default);
+                                }
+                                if let Some(a) = area {
+                                    ui.horizontal(|ui| {
+                                        let pct = |ui: &mut Ui, label: &str, v: &mut f32| {
+                                            ui.label(label);
+                                            let mut p = *v * 100.0;
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut p)
+                                                        .range(0.0..=100.0)
+                                                        .speed(0.5)
+                                                        .suffix("%"),
+                                                )
+                                                .changed()
+                                            {
+                                                *v = p / 100.0;
+                                            }
+                                        };
+                                        pct(ui, "Left", &mut a.x);
+                                        pct(ui, "Top", &mut a.y);
+                                        pct(ui, "Width", &mut a.w);
+                                        pct(ui, "Height", &mut a.h);
+                                    });
+                                    *a = a.clamped();
+                                }
+                            });
                             ui.end_row();
                         }
                         StreamKind::DeckLink { device, size } => {
@@ -4962,6 +5052,12 @@ fn stream_editor(ui: &mut Ui, d: &mut OutputConfig, engine: &mut Engine, st: &Ui
                             "⚠ The NDI runtime isn't installed on this computer: get the NDI \
                              Runtime or NDI Tools from ndi.video, then restart NewQ."
                         }
+                    }
+                    StreamKind::Record { .. } => {
+                        "Records the picture (no sound) to a new file each time it starts, named \r
+                         by the day and time. The size is the height below; an area keeps only \r
+                         part of the picture. Stopping closes the file, which can take a few \r
+                         seconds. MKV is the safest if the computer might stop mid-recording."
                     }
                     StreamKind::DeckLink { .. } => {
                         "Sends the picture (no sound) to a Blackmagic UltraStudio or DeckLink \

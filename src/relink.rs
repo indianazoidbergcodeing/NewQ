@@ -255,7 +255,7 @@ pub fn default_roots(show_dir: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var)
         .map(PathBuf::from)
