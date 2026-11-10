@@ -224,6 +224,18 @@ pub struct UiState {
     /// computer is to be allowed to run a server for a show. The app saves it.
     pub hosting_allow_request: std::cell::Cell<bool>,
     pub selected: Option<CueId>,
+    /// Every cue picked with Ctrl/Shift-click, `selected` among them. Only
+    /// counts while `selected` is still `multi_for`: any other way of choosing
+    /// a cue ends the multiple selection.
+    multi: Vec<CueId>,
+    multi_for: Option<CueId>,
+    /// Cues copied with Copy or Cut, for Paste (kept while another show is opened).
+    clipboard: Vec<Cue>,
+    /// Which show the clipboard was copied from (`show_epoch` then), and whether it was cut.
+    clipboard_epoch: u64,
+    clipboard_cut: bool,
+    /// Counts the shows opened (and test shows): cue numbers mean other cues in another.
+    show_epoch: u64,
     pub show_path: Option<PathBuf>,
     pub monitors: Vec<MonitorInfo>,
     /// Which of them the main window is on (set each frame by the app).
@@ -378,7 +390,48 @@ pub struct TestStash {
     lists: crate::engine::ListState,
 }
 
+/// Cues being dragged in the cue list.
+struct DraggedCues(Vec<CueId>);
+
 impl UiState {
+    /// The cues picked, in the order of the show (the one selected alone if
+    /// there is no multiple selection; empty if none).
+    pub fn selection(&self, show: &Show) -> Vec<CueId> {
+        let Some(sel) = self.selected else {
+            return Vec::new();
+        };
+        if self.multi_for != Some(sel) || self.multi.len() < 2 {
+            return vec![sel];
+        }
+        let want: std::collections::HashSet<CueId> = self.multi.iter().copied().collect();
+        show.cues
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| want.contains(id))
+            .collect()
+    }
+
+    /// Let go of a multiple selection that `selected` has moved away from (it
+    /// would come back if `selected` came to the same cue again).
+    fn sync_selection(&mut self) {
+        if self.multi_for != self.selected {
+            self.forget_multi();
+        }
+    }
+
+    /// Choose these cues; `primary` is the one the inspector shows.
+    fn select_many(&mut self, ids: Vec<CueId>, primary: CueId) {
+        self.selected = Some(primary);
+        self.multi_for = self.selected;
+        self.multi = ids;
+    }
+
+    /// End a multiple selection.
+    fn forget_multi(&mut self) {
+        self.multi.clear();
+        self.multi_for = None;
+    }
+
     /// Put `test_show` in the place of the show and lock it. Everything about
     /// the show that the interface keeps (its file, unsaved-changes mark, undo
     /// history, selection, show mode, search, the playheads) is put aside in
@@ -406,6 +459,8 @@ impl UiState {
         engine.set_paused(false);
         engine.playhead = show.cues.first().map(|c| c.id);
         self.selected = engine.playhead;
+        self.forget_multi();
+        self.show_epoch += 1;
         self.saved_json = serde_json::to_string(show).ok();
         if let Some(j) = &self.saved_json {
             self.history.reset(j.clone());
@@ -424,6 +479,8 @@ impl UiState {
         *show = stash.show;
         engine.restore_list_state(stash.lists);
         self.selected = stash.selected;
+        self.forget_multi();
+        self.show_epoch += 1;
         self.show_path = stash.show_path;
         self.dirty = stash.dirty;
         self.saved_json = stash.saved_json;
@@ -560,7 +617,19 @@ enum Action {
     RemoveSlide(CueId),
     Delete,
     Duplicate,
+    /// Keep a copy of the selected cues for Paste.
+    Copy,
+    /// Copy, then delete.
+    Cut,
+    /// Put the copied cues in after the selected cue (or into a selected group).
+    Paste,
     Move(i32),
+    /// Add a cue to the selection, or take it out (Ctrl/Cmd-click).
+    ToggleSelect(CueId),
+    /// Select every cue from the one selected to this one (Shift-click).
+    SelectRange(CueId),
+    /// Drop cues (dragged in the cue list) before, after or into a cue.
+    MoveCues(Vec<CueId>, DropAt),
     New,
     Open,
     Save,
@@ -693,7 +762,10 @@ impl Action {
                 | Action::RemoveSlide(_)
                 | Action::Delete
                 | Action::Duplicate
+                | Action::Cut
+                | Action::Paste
                 | Action::Move(_)
+                | Action::MoveCues(..)
                 | Action::AddSyncCue(_)
                 | Action::RelinkFolder(_)
                 | Action::RelinkCue(..)
@@ -759,6 +831,7 @@ fn cue_label(c: &Cue) -> String {
 }
 
 pub fn draw(ui: &mut Ui, show: &mut Show, engine: &mut Engine, st: &mut UiState) {
+    st.sync_selection();
     if st.saved_json.is_none() {
         st.saved_json = serde_json::to_string(show).ok();
     }
@@ -929,6 +1002,7 @@ fn restore(json: &str, show: &mut Show, engine: &mut Engine, st: &mut UiState) {
             if st.selected.is_some_and(|id| show.cue(id).is_none()) {
                 st.selected = engine.playhead;
             }
+            st.forget_multi();
             st.capture_hotkey = None;
         }
         Err(e) => engine.log(format!("Could not restore that step: {e}")),
@@ -987,6 +1061,9 @@ fn keyboard(ctx: &egui::Context, show: &Show, st: &UiState, actions: &mut Vec<Ac
     }
     let typing = ctx.egui_wants_keyboard_input();
     let nudging = st.selected_handle().is_some();
+    // Put something on the system clipboard when cues are copied: the window system
+    // sends a paste only when the clipboard holds some text.
+    let mut put_on_clipboard = false;
     ctx.input_mut(|i| {
         if fresh_key(i, egui::Modifiers::NONE, Key::Escape) && !st.finding {
             actions.push(Action::Panic);
@@ -1025,6 +1102,33 @@ fn keyboard(ctx: &egui::Context, show: &Show, st: &UiState, actions: &mut Vec<Ac
         }
         if i.consume_key(egui::Modifiers::COMMAND, Key::Z) {
             actions.push(Action::Undo);
+        }
+        // Ctrl+C, X and V arrive as events of their own, not as keys.
+        let (mut copy, mut cut, mut paste) = (false, false, false);
+        i.events.retain(|e| match e {
+            egui::Event::Copy => {
+                copy = true;
+                false
+            }
+            egui::Event::Cut => {
+                cut = true;
+                false
+            }
+            egui::Event::Paste(_) => {
+                paste = true;
+                false
+            }
+            _ => true,
+        });
+        put_on_clipboard = copy || cut;
+        if copy {
+            actions.push(Action::Copy);
+        }
+        if cut {
+            actions.push(Action::Cut);
+        }
+        if paste {
+            actions.push(Action::Paste);
         }
         if nudging {
             // The arrow keys move the selected corner: 1 px, or 5 px with Shift.
@@ -1125,6 +1229,9 @@ fn keyboard(ctx: &egui::Context, show: &Show, st: &UiState, actions: &mut Vec<Ac
             actions.push(Action::Delete);
         }
     });
+    if put_on_clipboard {
+        ctx.copy_text("NewQ cues".to_string());
+    }
 }
 
 /// The content of one pane, wherever it is: in the main window's dock or in a
@@ -1492,6 +1599,35 @@ fn menu_bar(ui: &mut Ui, show: &Show, st: &UiState, actions: &mut Vec<Action>) {
                 actions.push(Action::Redo);
             }
             ui.separator();
+            let has_cue = st.selected.is_some();
+            if ui
+                .add_enabled(has_cue, egui::Button::new("Copy cue").shortcut_text("Ctrl+C"))
+                .clicked()
+            {
+                actions.push(Action::Copy);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    has_cue && !st.show_mode,
+                    egui::Button::new("Cut cue").shortcut_text("Ctrl+X"),
+                )
+                .clicked()
+            {
+                actions.push(Action::Cut);
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    !st.clipboard.is_empty() && !st.show_mode,
+                    egui::Button::new("Paste cue").shortcut_text("Ctrl+V"),
+                )
+                .clicked()
+            {
+                actions.push(Action::Paste);
+                ui.close();
+            }
+            ui.separator();
             if ui
                 .add(egui::Button::new("Find cues").shortcut_text("Ctrl+F"))
                 .clicked()
@@ -1558,6 +1694,7 @@ fn menu_bar(ui: &mut Ui, show: &Show, st: &UiState, actions: &mut Vec<Action>) {
                 CueType::Send,
                 CueType::Timecode,
                 CueType::Text,
+                CueType::Shape,
                 CueType::Clock,
                 CueType::Timer,
                 CueType::Fade,
@@ -1946,7 +2083,11 @@ pub(crate) fn cue_target_text(show: &Show, c: &Cue) -> String {
                 .and_then(|o| show.output(o))
                 .map(|o| o.name.as_str())
                 .unwrap_or("no output");
-            format!("{file}  »  {out}")
+            if m.layer == 0 {
+                format!("{file}  »  {out}")
+            } else {
+                format!("{file}  »  {out}  (layer {})", m.layer)
+            }
         }
         CueKind::Audio(m) => m
             .file
@@ -2002,6 +2143,24 @@ pub(crate) fn cue_target_text(show: &Show, c: &Cue) -> String {
                 .map(|o| o.name.as_str())
                 .unwrap_or("no output");
             format!("“{first}{more}”  »  {out}")
+        }
+        CueKind::Shape(s) => {
+            let out = s
+                .media
+                .output
+                .and_then(|o| show.output(o))
+                .map(|o| o.name.as_str())
+                .unwrap_or("no output");
+            let layer = if s.media.layer == 0 {
+                String::new()
+            } else {
+                format!("  (layer {})", s.media.layer)
+            };
+            let [r, g, b, _] = s.color;
+            format!(
+                "{}  #{r:02X}{g:02X}{b:02X}  »  {out}{layer}",
+                s.shape.label()
+            )
         }
         CueKind::Camera(cam) => {
             let device = if cam.device.is_empty() {
@@ -2136,6 +2295,10 @@ fn cue_list(
         if !st.cue_filter.is_empty() && ui.small_button("Clear").clicked() {
             st.cue_filter.clear();
         }
+        let n = st.selection(show).len();
+        if n > 1 {
+            ui.label(RichText::new(format!("{n} cues selected")).weak());
+        }
     });
     // Column layout: (title, width); a width of 0 takes the remaining space.
     let cols: [(&str, f32); 9] = [
@@ -2192,9 +2355,40 @@ fn cue_list(
     }
     ui.spacing_mut().item_spacing.y = 1.0;
     let row_pitch = ROW_H + ui.spacing().item_spacing.y;
+    #[cfg(test)]
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("cue_rows"), Vec::<(CueId, egui::Rect)>::new()));
+    // The cues picked, and whether rows can be dragged (not in show mode, and
+    // not while a search hides most of the list).
+    let picked = st.selection(show);
+    let picked_set: std::collections::HashSet<CueId> = picked.iter().copied().collect();
+    let can_drag = !st.show_mode && query.is_empty();
+    let dragged = egui::DragAndDrop::payload::<DraggedCues>(ui.ctx());
+    let drag_set: std::collections::HashSet<CueId> = dragged
+        .as_ref()
+        .map(|d| d.0.iter().copied().collect())
+        .unwrap_or_default();
+    let carries_group = !drag_set.is_empty()
+        && show
+            .cues
+            .iter()
+            .any(|c| matches!(c.kind, CueKind::Group(_)) && drag_set.contains(&c.id));
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show_rows(ui, ROW_H, visible.len(), |ui, rows| {
+            // Dragging near the top or bottom edge scrolls the list.
+            if dragged.is_some() {
+                if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                    let view = ui.clip_rect();
+                    if view.x_range().contains(pos.x) {
+                        if pos.y < view.top() + 28.0 {
+                            ui.scroll_with_delta(Vec2::new(0.0, 14.0));
+                        } else if pos.y > view.bottom() - 28.0 {
+                            ui.scroll_with_delta(Vec2::new(0.0, -14.0));
+                        }
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
             if st.scroll_to_selected {
                 st.scroll_to_selected = false;
                 // The row may not be drawn, so find where it would be.
@@ -2221,7 +2415,17 @@ fn cue_list(
                 .collect();
             for &idx in &visible[rows] {
                 let c = &show.cues[idx];
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(total, ROW_H), Sense::click());
+                let sense = if can_drag {
+                    Sense::click_and_drag()
+                } else {
+                    Sense::click()
+                };
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(total, ROW_H), sense);
+                #[cfg(test)]
+                ui.data_mut(|d| {
+                    d.get_temp_mut_or_default::<Vec<(CueId, egui::Rect)>>(egui::Id::new("cue_rows"))
+                        .push((c.id, rect))
+                });
                 // The fold arrow of a group sits at the start of its name.
                 let indent = if c.parent.is_some() {
                     CHILD_INDENT
@@ -2244,16 +2448,86 @@ fn cue_list(
                     _ => None,
                 };
                 if resp.clicked() {
-                    actions.push(Action::Select(c.id));
+                    // Ctrl (Cmd on a Mac) adds or removes a cue; Shift takes a run of them.
+                    let m = ui.input(|i| i.modifiers);
+                    actions.push(if m.command {
+                        Action::ToggleSelect(c.id)
+                    } else if m.shift {
+                        Action::SelectRange(c.id)
+                    } else {
+                        Action::Select(c.id)
+                    });
                 }
                 if resp.double_clicked() {
                     actions.push(Action::FireSelected);
                 }
+                if can_drag && resp.drag_started() {
+                    // Dragging a cue of the selection takes all of it; any other cue alone.
+                    let ids = if picked_set.contains(&c.id) {
+                        picked.clone()
+                    } else {
+                        actions.push(Action::Select(c.id));
+                        vec![c.id]
+                    };
+                    resp.dnd_set_drag_payload(DraggedCues(ids));
+                }
+                if let Some(d) = &dragged {
+                    // Where a drop here would go: into a group (its middle), before
+                    // this cue (its top half) or after it (the rest).
+                    let own =
+                        drag_set.contains(&c.id) || c.parent.is_some_and(|g| drag_set.contains(&g));
+                    if !own
+                        && let Some(pos) = ui.ctx().pointer_latest_pos()
+                        && rect.contains(pos)
+                    {
+                        let frac = (pos.y - rect.top()) / ROW_H;
+                        let is_group = matches!(c.kind, CueKind::Group(_));
+                        let open_group_child = match &c.kind {
+                            CueKind::Group(g) if !g.collapsed && !carries_group => show
+                                .children(c.id)
+                                .iter()
+                                .find(|k| !drag_set.contains(&k.id))
+                                .map(|k| k.id),
+                            _ => None,
+                        };
+                        let (at, line) = if is_group && !carries_group && (0.3..0.7).contains(&frac)
+                        {
+                            (DropAt::Into(c.id), None)
+                        } else if frac < 0.5 {
+                            (DropAt::Before(c.id), Some(rect.top()))
+                        } else if let Some(first) = open_group_child {
+                            (DropAt::Before(first), Some(rect.bottom()))
+                        } else {
+                            (DropAt::After(c.id), Some(rect.bottom()))
+                        };
+                        let color = ui.visuals().selection.stroke.color;
+                        match line {
+                            Some(y) => {
+                                ui.painter().hline(
+                                    rect.left()..=rect.right(),
+                                    y,
+                                    Stroke::new(2.0, color),
+                                );
+                            }
+                            None => {
+                                ui.painter().rect_stroke(
+                                    rect.shrink(1.0),
+                                    2.0,
+                                    Stroke::new(2.0, color),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                        }
+                        if ui.input(|i| i.pointer.any_released()) {
+                            actions.push(Action::MoveCues(d.0.clone(), at));
+                        }
+                    }
+                }
                 resp.context_menu(|ui| {
-                    cue_context_menu(ui, c, &groups, &lists, show_mode, actions)
+                    cue_context_menu(ui, c, &groups, &lists, show_mode, &picked, actions)
                 });
                 let status = engine.status(c.id);
-                let selected = st.selected == Some(c.id);
+                let selected = picked_set.contains(&c.id);
                 let at_playhead = engine.playhead == Some(c.id);
                 let painter = ui.painter_at(rect);
                 let v = ui.visuals();
@@ -2420,6 +2694,24 @@ fn cue_list(
                 );
             }
         });
+    // What is being dragged, next to the pointer.
+    if let Some(d) = &dragged
+        && let Some(pos) = ui.ctx().pointer_latest_pos()
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let text = match d.0.as_slice() {
+            [one] => show
+                .cue(*one)
+                .map_or_else(String::new, |c| format!("{}  {}", c.number, c.name)),
+            many => format!("{} cues", many.len()),
+        };
+        let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("cue_drag_ghost"));
+        let painter = ui.ctx().layer_painter(layer);
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(14.0), Color32::WHITE);
+        let at = egui::Rect::from_min_size(pos + Vec2::new(16.0, 16.0), galley.size()).expand(5.0);
+        painter.rect_filled(at, 4.0, Color32::from_black_alpha(215));
+        painter.galley(at.min + Vec2::splat(5.0), galley, Color32::WHITE);
+    }
 }
 
 /// A wait for the status bar: "42 s", "12 min", "3 h 05 min".
@@ -3353,19 +3645,23 @@ fn cue_context_menu(
     groups: &[(CueId, String)],
     lists: &[(u32, String)],
     show_mode: bool,
+    picked: &[CueId],
     actions: &mut Vec<Action>,
 ) {
-    actions.push(Action::Select(c.id));
+    // Right-clicking a cue of the selection keeps the selection.
+    if !picked.contains(&c.id) {
+        actions.push(Action::Select(c.id));
+    }
     if ui.button("▶ Fire").clicked() {
-        actions.push(Action::FireSelected);
+        actions.push(Action::FireCue(c.id));
         ui.close();
     }
     if ui.button("Fade out").clicked() {
-        actions.push(Action::FadeOutSelected);
+        actions.push(Action::FadeOutCue(c.id));
         ui.close();
     }
     if ui.button("⏹ Stop").clicked() {
-        actions.push(Action::StopSelected);
+        actions.push(Action::StopCue(c.id));
         ui.close();
     }
     // Show mode is for running the show: nothing below changes it.
@@ -3418,37 +3714,68 @@ fn cue_context_menu(
         actions.push(Action::SetArmed(c.id, !c.armed));
         ui.close();
     }
-    match (&c.kind, c.parent) {
-        (CueKind::Group(_), _) => {
-            if ui.button("Ungroup").clicked() {
-                actions.push(Action::Ungroup(c.id));
-                ui.close();
-            }
+    // Several cues picked: group them, or move them into a group, together.
+    let many = picked.len() > 1 && picked.contains(&c.id) && !matches!(c.kind, CueKind::Group(_));
+    if many {
+        if ui
+            .button(format!("Group the {} selected cues", picked.len()))
+            .clicked()
+        {
+            actions.push(Action::GroupCue(c.id));
+            ui.close();
         }
-        (_, Some(_)) => {
-            if ui.button("Move out of group").clicked() {
-                actions.push(Action::MoveOutOfGroup(c.id));
-                ui.close();
-            }
-        }
-        (_, None) => {
-            if ui.button("Wrap in group").clicked() {
-                actions.push(Action::GroupCue(c.id));
-                ui.close();
-            }
-            if !groups.is_empty() {
-                ui.menu_button("Move into group", |ui| {
-                    for (gid, label) in groups {
-                        if ui.button(label).clicked() {
-                            actions.push(Action::MoveIntoGroup(c.id, *gid));
-                            ui.close();
-                        }
+        if !groups.is_empty() {
+            ui.menu_button(format!("Move {} cues into group", picked.len()), |ui| {
+                for (gid, label) in groups {
+                    if ui.button(label).clicked() {
+                        actions.push(Action::MoveIntoGroup(c.id, *gid));
+                        ui.close();
                     }
-                });
+                }
+            });
+        }
+    } else {
+        match (&c.kind, c.parent) {
+            (CueKind::Group(_), _) => {
+                if ui.button("Ungroup").clicked() {
+                    actions.push(Action::Ungroup(c.id));
+                    ui.close();
+                }
+            }
+            (_, Some(_)) => {
+                if ui.button("Move out of group").clicked() {
+                    actions.push(Action::MoveOutOfGroup(c.id));
+                    ui.close();
+                }
+            }
+            (_, None) => {
+                if ui.button("Wrap in group").clicked() {
+                    actions.push(Action::GroupCue(c.id));
+                    ui.close();
+                }
+                if !groups.is_empty() {
+                    ui.menu_button("Move into group", |ui| {
+                        for (gid, label) in groups {
+                            if ui.button(label).clicked() {
+                                actions.push(Action::MoveIntoGroup(c.id, *gid));
+                                ui.close();
+                            }
+                        }
+                    });
+                }
             }
         }
     }
     ui.separator();
+    if ui.button("Copy").clicked() {
+        actions.push(Action::Copy);
+        ui.close();
+    }
+    if ui.button("Paste after this").clicked() {
+        actions.push(Action::Select(c.id));
+        actions.push(Action::Paste);
+        ui.close();
+    }
     if ui.button("Duplicate").clicked() {
         actions.push(Action::Duplicate);
         ui.close();
@@ -6512,7 +6839,59 @@ fn cue_picker(
         });
 }
 
+/// The inspector of the selected cue. With several cues picked, whatever is
+/// changed in it is made in the others too (`bulk_edit`).
 fn inspector(
+    ui: &mut Ui,
+    show: &mut Show,
+    engine: &mut Engine,
+    st: &mut UiState,
+    actions: &mut Vec<Action>,
+) {
+    let picked = st.selection(show);
+    let primary = st
+        .selected
+        .and_then(|id| show.cue(id))
+        .filter(|_| picked.len() > 1)
+        .cloned();
+    if primary.is_some() {
+        ui.label(
+            RichText::new(format!(
+                "{} cues selected: a change here is made in all of them (their names, files and \
+                 text stay as they are).",
+                picked.len()
+            ))
+            .color(Color32::from_rgb(230, 160, 40)),
+        );
+    }
+    inspector_one(ui, show, engine, st, actions);
+    if let Some(before) = primary {
+        spread_edit(show, &before, &picked);
+    }
+}
+
+/// Make in the other `picked` cues what was changed in `before`'s cue since.
+fn spread_edit(show: &mut Show, before: &Cue, picked: &[CueId]) {
+    let Some(after) = show.cue(before.id) else {
+        return;
+    };
+    // The change is worked out once; on most frames there is none.
+    let Some(change) = crate::bulk_edit::diff(before, after) else {
+        return;
+    };
+    let others: std::collections::HashSet<CueId> = picked
+        .iter()
+        .copied()
+        .filter(|&id| id != before.id)
+        .collect();
+    for cue in show.cues.iter_mut().filter(|c| others.contains(&c.id)) {
+        if let Some(changed) = change.apply(cue) {
+            *cue = changed;
+        }
+    }
+}
+
+fn inspector_one(
     ui: &mut Ui,
     show: &mut Show,
     engine: &mut Engine,
@@ -6953,6 +7332,22 @@ fn inspector(
                     actions,
                 );
             }
+            CueKind::Shape(s) => {
+                shape_inspector(ui, s);
+                ui.separator();
+                media_inspector(
+                    ui,
+                    cue_id,
+                    cue_type,
+                    &mut s.media,
+                    OutputChoices {
+                        video: &outputs,
+                        audio: &audio_outputs,
+                    },
+                    engine,
+                    actions,
+                );
+            }
             CueKind::Send(s) => send_inspector(ui, s, &st.midi_out_ports),
             CueKind::Timecode(t) => timecode_out_inspector(ui, t, &st.midi_out_ports),
             CueKind::Camera(c) => {
@@ -7079,12 +7474,18 @@ fn media_inspector(
     // played from a file.
     let timed = matches!(
         ty,
-        CueType::Image | CueType::Text | CueType::Camera | CueType::LiveAudio
+        CueType::Image | CueType::Text | CueType::Shape | CueType::Camera | CueType::LiveAudio
     );
     // What is shown has no sound; the rest is played (with volume and output).
-    let still = matches!(ty, CueType::Image | CueType::Text | CueType::Camera);
+    let still = matches!(
+        ty,
+        CueType::Image | CueType::Text | CueType::Shape | CueType::Camera
+    );
     // Text, cameras and live sound have no file to choose.
-    let is_text = matches!(ty, CueType::Text | CueType::Camera | CueType::LiveAudio);
+    let is_text = matches!(
+        ty,
+        CueType::Text | CueType::Shape | CueType::Camera | CueType::LiveAudio
+    );
     egui::Grid::new("media")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -7174,21 +7575,29 @@ fn media_inspector(
                         }
                     });
                 ui.end_row();
-                ui.label("Layer / Fit");
+                ui.label("Layer");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut m.layer).range(-100..=100))
-                        .on_hover_text("Higher layers draw on top");
-                    if !is_text {
-                        egui::ComboBox::from_id_salt("fit")
-                            .selected_text(m.fit.label())
-                            .show_ui(ui, |ui| {
-                                for f in Fit::ALL {
-                                    ui.selectable_value(&mut m.fit, f, f.label());
-                                }
-                            });
-                    }
+                    ui.add(egui::DragValue::new(&mut m.layer).range(-1000..=1000))
+                        .on_hover_text(
+                            "Which layer of the display this cue is on. A higher layer is drawn \
+                             on top of a lower one (1 over 0, 2 over 1 and 0), and layers can go \
+                             below 0. A cue replaces (cut, crossfade) only what is on its own \
+                             layer; cues on other layers keep playing.",
+                        );
+                    ui.label(RichText::new("higher is on top").weak());
                 });
                 ui.end_row();
+                if !is_text {
+                    ui.label("Fit");
+                    egui::ComboBox::from_id_salt("fit")
+                        .selected_text(m.fit.label())
+                        .show_ui(ui, |ui| {
+                            for f in Fit::ALL {
+                                ui.selectable_value(&mut m.fit, f, f.label());
+                            }
+                        });
+                    ui.end_row();
+                }
                 ui.label("Opacity");
                 ui.add(egui::Slider::new(&mut m.opacity, 0.0..=1.0));
                 ui.end_row();
@@ -7346,7 +7755,12 @@ fn media_inspector(
                 ui.end_row();
             }
         });
-    if !m.matrix.is_empty() && !matches!(ty, CueType::Image | CueType::Text | CueType::Camera) {
+    if !m.matrix.is_empty()
+        && !matches!(
+            ty,
+            CueType::Image | CueType::Text | CueType::Shape | CueType::Camera
+        )
+    {
         let device = engine.audio.device_status(m.audio_output);
         let rows = engine_channels(engine, &m.file).clamp(1, 8);
         let cols = device.map_or(2, |d| usize::from(d.channels)).clamp(2, 64);
@@ -8477,6 +8891,77 @@ fn live_audio_inspector(ui: &mut Ui, c: &mut LiveAudioCue, st: &UiState) {
     );
 }
 
+/// The part of a shape cue's inspector that is about the shape; the rest is the
+/// shared media section.
+fn shape_inspector(ui: &mut Ui, s: &mut ShapeCue) {
+    egui::Grid::new("shape_style")
+        .num_columns(2)
+        .spacing([12.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Shape");
+            egui::ComboBox::from_id_salt("shape_kind")
+                .selected_text(s.shape.label())
+                .show_ui(ui, |ui| {
+                    for k in ShapeKind::ALL {
+                        ui.selectable_value(&mut s.shape, k, k.label());
+                    }
+                });
+            ui.end_row();
+            let pct = |ui: &mut Ui, v: &mut f32| {
+                let mut p = *v * 100.0;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut p)
+                            .speed(0.2)
+                            .range(0.0..=400.0)
+                            .suffix("% of height"),
+                    )
+                    .changed()
+                {
+                    *v = p / 100.0;
+                }
+            };
+            if s.shape.has_width() {
+                ui.label("Width");
+                pct(ui, &mut s.width);
+                ui.end_row();
+                ui.label("Height");
+            } else {
+                ui.label("Size");
+            }
+            pct(ui, &mut s.height);
+            ui.end_row();
+            if s.shape == ShapeKind::Star {
+                ui.label("Points");
+                let mut n = s.points;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut n)
+                            .range(crate::shape::MIN_POINTS..=crate::shape::MAX_POINTS),
+                    )
+                    .changed()
+                {
+                    s.points = n;
+                }
+                ui.end_row();
+            }
+            ui.label("Colour");
+            let [r, g, b, a] = s.color;
+            let mut c = Color32::from_rgba_unmultiplied(r, g, b, a);
+            if ui.color_edit_button_srgba(&mut c).changed() {
+                s.color = c.to_srgba_unmultiplied();
+            }
+            ui.end_row();
+        });
+    ui.label(
+        RichText::new(
+            "Drawn in the middle of the display. Use the cue's geometry to move or scale it, \
+             and the colour's opacity to make it see-through.",
+        )
+        .weak(),
+    );
+}
+
 /// What a text cue says and how it looks; where, when and how it plays is the
 /// shared media section.
 fn text_inspector(ui: &mut Ui, t: &mut TextCue) {
@@ -9203,6 +9688,8 @@ fn load_into(
     engine.forget_lists();
     engine.playhead = show.cues.first().map(|c| c.id);
     st.selected = engine.playhead;
+    st.forget_multi();
+    st.show_epoch += 1;
     st.show_path = path;
     st.saved_json = serde_json::to_string(show).ok();
     st.check_media(show);
@@ -9438,6 +9925,7 @@ fn select_new(
         g.collapsed = false;
     }
     st.selected = Some(id);
+    st.forget_multi();
     st.scroll_to_selected = true;
     if engine.playhead.is_none() {
         engine.playhead = Some(parent.unwrap_or(id));
@@ -9451,6 +9939,7 @@ fn select(show: &Show, st: &mut UiState, engine: &mut Engine, id: Option<CueId>)
         engine.switch_list(show, c.list);
     }
     st.selected = id;
+    st.forget_multi();
     engine.playhead = id.map(|id| show.top_id(id));
 }
 
@@ -9473,6 +9962,7 @@ fn set_show_mode(st: &mut UiState, engine: &mut Engine, on: bool) {
 }
 
 fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState) {
+    st.sync_selection();
     // While a test show is in place of the show, nothing may change it, save
     // it over the real one, or open another.
     if st.test_locked
@@ -9722,9 +10212,9 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
             }
         }
         Action::Delete => {
-            if let Some(i) = sel_idx {
-                // A group goes with its children.
-                let removed = show.delete(i);
+            let picked = st.selection(show);
+            // A group goes with its children.
+            if let Some((i, removed)) = show.delete_many(&picked) {
                 for id in &removed {
                     engine.stop_cue(*id, 0.0);
                 }
@@ -9736,21 +10226,167 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
                     engine.playhead = next.map(|id| show.top_id(id));
                 }
                 st.selected = next;
+                st.forget_multi();
+            }
+        }
+        Action::Copy => {
+            let picked = st.selection(show);
+            let copied = show.copy_cues(&picked);
+            if !copied.is_empty() {
+                let n = picked.len();
+                st.clipboard = copied;
+                st.clipboard_epoch = st.show_epoch;
+                st.clipboard_cut = false;
+                engine.log(if n == 1 {
+                    "Copied the cue".to_string()
+                } else {
+                    format!("Copied {n} cues")
+                });
+            }
+        }
+        Action::Cut => {
+            apply(Action::Copy, show, engine, st);
+            // What was cut comes back with its ids, so what aimed at it still does.
+            let kept = !st.clipboard.is_empty();
+            apply(Action::Delete, show, engine, st);
+            st.clipboard_cut = kept;
+        }
+        Action::Paste => {
+            let copies = std::mem::take(&mut st.clipboard);
+            let heads = show.paste_cues(
+                &copies,
+                st.selected,
+                engine.active_list,
+                st.clipboard_epoch == st.show_epoch,
+                st.clipboard_cut,
+            );
+            st.clipboard = copies;
+            // Only the first paste of a cut puts the cues back as they were.
+            st.clipboard_cut = false;
+            if let Some(&last) = heads.last() {
+                // The new cues are the selection, and a group they went into is opened.
+                let parent = show.cue(last).and_then(|c| c.parent);
+                select_new(show, st, engine, parent, last);
+                if heads.len() > 1 {
+                    st.select_many(heads.clone(), last);
+                }
+                engine.log(if heads.len() == 1 {
+                    "Pasted the cue".to_string()
+                } else {
+                    format!("Pasted {} cues", heads.len())
+                });
             }
         }
         Action::Duplicate => {
-            if let Some(i) = sel_idx {
-                let parent = show.cues[i].parent;
-                let copy = show.duplicate(i);
-                select_new(show, st, engine, parent, copy);
+            let picked = st.selection(show);
+            // A group's copy has its children; they aren't copied again.
+            let lead: Vec<CueId> = picked
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    show.cue(id)
+                        .and_then(|c| c.parent)
+                        .is_none_or(|g| !picked.contains(&g))
+                })
+                .collect();
+            let mut copies = Vec::new();
+            let mut parent = None;
+            for id in lead {
+                if let Some(i) = show.cue_index(id) {
+                    parent = show.cues[i].parent;
+                    copies.push(show.duplicate(i));
+                }
+            }
+            match copies.as_slice() {
+                [] => {}
+                [one] => select_new(show, st, engine, parent, *one),
+                [.., last] => {
+                    let last = *last;
+                    select_new(show, st, engine, parent, last);
+                    st.select_many(copies, last);
+                }
             }
         }
         Action::Move(d) => {
-            if let Some(i) = sel_idx
-                && show.move_cue(i, d).is_some()
-            {
+            let picked = st.selection(show);
+            // A group carries its children, so they don't move separately.
+            let mut lead: Vec<CueId> = picked
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    show.cue(id)
+                        .and_then(|c| c.parent)
+                        .is_none_or(|g| !picked.contains(&g))
+                })
+                .collect();
+            if d > 0 {
+                lead.reverse();
+            }
+            let mut moved = false;
+            for id in lead {
+                let Some(i) = show.cue_index(id) else {
+                    continue;
+                };
+                // The first that can't move holds the rest back.
+                if show.move_cue(i, d).is_none() {
+                    break;
+                }
+                moved = true;
+            }
+            if moved {
                 // A child that left its group moves the playhead's idea of its home.
-                select(show, st, engine, st.selected);
+                if let Some(s) = st.selected {
+                    engine.playhead = Some(show.top_id(s));
+                }
+                st.scroll_to_selected = true;
+            }
+        }
+        Action::ToggleSelect(id) => {
+            let mut now = st.selection(show);
+            match now.iter().position(|&x| x == id) {
+                Some(p) => {
+                    now.remove(p);
+                }
+                None => now.push(id),
+            }
+            match now.last().copied() {
+                None => {
+                    st.selected = None;
+                    st.forget_multi();
+                }
+                Some(primary) => st.select_many(now, primary),
+            }
+        }
+        Action::SelectRange(id) => {
+            let anchor = st.selected.unwrap_or(id);
+            let mut rows = show.visible_indices();
+            rows.retain(|&i| show.cues[i].list == engine.active_list);
+            let at = |id| rows.iter().position(|&i| show.cues[i].id == id);
+            if let (Some(a), Some(b)) = (at(anchor), at(id)) {
+                let (lo, hi) = (a.min(b), a.max(b));
+                let ids = rows[lo..=hi].iter().map(|&i| show.cues[i].id).collect();
+                st.select_many(ids, id);
+            } else {
+                select(show, st, engine, Some(id));
+            }
+        }
+        Action::MoveCues(ids, at) => {
+            if show.move_cues(&ids, at) {
+                if let DropAt::Into(g) = at
+                    && let Some(i) = show.cue_index(g)
+                    && let CueKind::Group(g) = &mut show.cues[i].kind
+                {
+                    g.collapsed = false;
+                }
+                // A cue that went into or out of a group changes the playhead's top-level cue.
+                engine.playhead = engine.playhead.map(|p| show.top_id(p));
+                let primary = st
+                    .selected
+                    .filter(|s| ids.contains(s))
+                    .or_else(|| ids.last().copied());
+                if let Some(primary) = primary {
+                    st.select_many(ids, primary);
+                }
                 st.scroll_to_selected = true;
             }
         }
@@ -10057,8 +10693,14 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
             }
         }
         Action::ToggleArmed => {
+            // All the picked cues take the opposite of the first's state.
             if let Some(i) = sel_idx {
-                show.cues[i].armed = !show.cues[i].armed;
+                let armed = !show.cues[i].armed;
+                for id in st.selection(show) {
+                    if let Some(k) = show.cue_index(id) {
+                        show.cues[k].armed = armed;
+                    }
+                }
             }
         }
         Action::ToggleGroup(id) => {
@@ -10078,7 +10720,16 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
             }
         }
         Action::GroupCue(id) => {
-            if let Some(i) = show.cue_index(id)
+            // Several picked cues go into one new group.
+            let picked = st.selection(show);
+            if picked.len() > 1 && picked.contains(&id) {
+                if let Some(g) = show.group_cues(&picked) {
+                    engine.playhead = engine.playhead.map(|p| show.top_id(p));
+                    st.selected = Some(g);
+                    st.forget_multi();
+                    st.scroll_to_selected = true;
+                }
+            } else if let Some(i) = show.cue_index(id)
                 && let Some(g) = show.group_cue(i)
             {
                 if engine.playhead == Some(id) {
@@ -10101,7 +10752,20 @@ fn apply(action: Action, show: &mut Show, engine: &mut Engine, st: &mut UiState)
             }
         }
         Action::MoveIntoGroup(id, group) => {
-            if let Some(i) = show.cue_index(id)
+            // Several picked cues all go into the group.
+            let picked = st.selection(show);
+            if picked.len() > 1 && picked.contains(&id) {
+                if show.move_cues(&picked, DropAt::Into(group)) {
+                    if let Some(g) = show.cue_index(group)
+                        && let CueKind::Group(g) = &mut show.cues[g].kind
+                    {
+                        g.collapsed = false;
+                    }
+                    engine.playhead = engine.playhead.map(|p| show.top_id(p));
+                    st.select_many(picked, id);
+                    st.scroll_to_selected = true;
+                }
+            } else if let Some(i) = show.cue_index(id)
                 && show.move_into(i, group)
             {
                 if let Some(g) = show.cue_index(group)
@@ -10854,6 +11518,84 @@ mod tests {
         assert!(matches!(a[..], [Action::ToggleArmed]));
         // Ctrl+A is not the shortcut.
         assert!(keys(&st, &[(Key::A, M::COMMAND)]).is_empty());
+    }
+
+    #[test]
+    fn copy_cut_and_paste_work_on_cues_from_the_keyboard_the_menu_and_between_shows() {
+        let events = |events: Vec<Event>, st: &UiState| {
+            let ctx = egui::Context::default();
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(input, |ui| {
+                keyboard(ui.ctx(), &Show::default(), st, &mut actions)
+            });
+            out.textures_delta.clear();
+            actions
+        };
+        let st = UiState::default();
+        // Ctrl+C, X and V reach the app as these events.
+        assert!(matches!(events(vec![Event::Copy], &st)[..], [Action::Copy]));
+        assert!(matches!(events(vec![Event::Cut], &st)[..], [Action::Cut]));
+        assert!(matches!(
+            events(vec![Event::Paste("text".into())], &st)[..],
+            [Action::Paste]
+        ));
+
+        let (mut show, mut e, mut st) = running();
+        let names = |show: &Show| show.cues.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let first = show.cues[0].id;
+        let before = show.cues.len();
+        select(&show, &mut st, &mut e, Some(first));
+        // Nothing to paste yet.
+        apply(Action::Paste, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), before);
+        // Copy, then paste further down: one more cue, a new one, selected.
+        apply(Action::Copy, &mut show, &mut e, &mut st);
+        assert_eq!(st.clipboard.len(), 1);
+        let last = show.cues.last().unwrap().id;
+        select(&show, &mut st, &mut e, Some(last));
+        apply(Action::Paste, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), before + 1);
+        let pasted = show.cues.last().unwrap();
+        assert_eq!(pasted.name, show.cues[0].name);
+        assert!(pasted.id != first);
+        assert_eq!(st.selected, Some(pasted.id));
+        // And again: the copy is still there.
+        apply(Action::Paste, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), before + 2);
+        // Cut takes it out and keeps it for pasting.
+        let n = show.cues.len();
+        let vi = (1..show.cues.len())
+            .find(|&i| show.cues[i].parent.is_none() && !show.is_group(i))
+            .unwrap();
+        let victim = show.cues[vi].id;
+        let victim_name = show.cues[vi].name.clone();
+        select(&show, &mut st, &mut e, Some(victim));
+        apply(Action::Cut, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), n - 1);
+        assert!(show.cue(victim).is_none());
+        apply(Action::Paste, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), n);
+        assert!(names(&show).contains(&victim_name));
+        // The copies survive opening another show.
+        let mut other = Show::default();
+        let (mut e2, mut st2) = (Engine::for_tests(), UiState::default());
+        st2.clipboard = std::mem::take(&mut st.clipboard);
+        apply(Action::Paste, &mut other, &mut e2, &mut st2);
+        assert_eq!(other.cues.len(), 1);
+        assert_eq!(other.cues[0].name, victim_name);
+        // Show mode refuses a paste and a cut, but not a copy.
+        st2.show_mode = true;
+        apply(Action::Paste, &mut other, &mut e2, &mut st2);
+        assert_eq!(other.cues.len(), 1);
+        apply(Action::Cut, &mut other, &mut e2, &mut st2);
+        assert_eq!(other.cues.len(), 1);
+        apply(Action::Copy, &mut other, &mut e2, &mut st2);
+        assert_eq!(st2.clipboard.len(), 1);
     }
 
     #[test]
@@ -13263,6 +14005,455 @@ mod tests {
             hit,
             "the last of 2,000 cues was not on screen after scrolling to it"
         );
+    }
+
+    /// Drives the cue list with the mouse, applying the actions it asks for.
+    struct ListMouse {
+        ctx: egui::Context,
+        e: Engine,
+        t: f64,
+        mods: egui::Modifiers,
+        sent: egui::Modifiers,
+    }
+
+    impl ListMouse {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                e: Engine::for_tests(),
+                t: 1.0,
+                mods: Default::default(),
+                sent: Default::default(),
+            }
+        }
+
+        fn frame(&mut self, show: &mut Show, st: &mut UiState, mut events: Vec<Event>) {
+            self.t += 1.0 / 60.0;
+            if self.mods != self.sent {
+                events.insert(0, Event::ModifiersChanged(self.mods));
+                self.sent = self.mods;
+            }
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0))),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let e = &mut self.e;
+            let mut out = self
+                .ctx
+                .run_ui(input, |ui| cue_list(ui, show, e, st, &mut actions));
+            out.textures_delta.clear();
+            for a in actions {
+                apply(a, show, &mut self.e, st);
+            }
+        }
+
+        fn row(&mut self, show: &mut Show, st: &mut UiState, name: &str) -> Rect {
+            self.frame(show, st, vec![]);
+            let rows: Vec<(CueId, Rect)> = self
+                .ctx
+                .data(|d| d.get_temp(egui::Id::new("cue_rows")))
+                .expect("the list was drawn");
+            let id = show.cues.iter().find(|c| c.name == name).unwrap().id;
+            rows.iter().find(|r| r.0 == id).unwrap().1
+        }
+
+        fn click(&mut self, show: &mut Show, st: &mut UiState, name: &str, mods: egui::Modifiers) {
+            let at = self.row(show, st, name).center() + vec2(40.0, 0.0);
+            self.mods = mods;
+            self.frame(show, st, vec![Event::PointerMoved(at)]);
+            self.frame(show, st, vec![button(at, true)]);
+            self.frame(show, st, vec![button(at, false)]);
+            self.mods = Default::default();
+        }
+
+        /// Press on one row and let go on a place `frac` of the way down another.
+        fn drag(&mut self, show: &mut Show, st: &mut UiState, from: &str, to: &str, frac: f32) {
+            let a = self.row(show, st, from).center() + vec2(40.0, 0.0);
+            let r = self.row(show, st, to);
+            let b = pos2(a.x, r.top() + r.height() * frac);
+            self.frame(show, st, vec![Event::PointerMoved(a)]);
+            self.frame(show, st, vec![button(a, true)]);
+            for i in 1..=8 {
+                let p = a + (b - a) * (i as f32 / 8.0);
+                self.frame(show, st, vec![Event::PointerMoved(p)]);
+            }
+            self.frame(show, st, vec![Event::PointerMoved(b), button(b, false)]);
+            self.frame(show, st, vec![]);
+        }
+    }
+
+    /// a, a group "G" with b and c in it, d, e.
+    fn listed() -> Show {
+        let mut show = Show::default();
+        for n in ["a", "b", "c", "d", "e"] {
+            let mut c = show.make_cue(CueType::Wait, None, show.cues.len());
+            c.name = n.into();
+            show.cues.push(c);
+        }
+        let g = show.group_cue(1).unwrap();
+        let gi = show.cue_index(g).unwrap();
+        show.cues[gi].name = "G".into();
+        assert!(show.move_into(3, g));
+        show
+    }
+
+    fn names(show: &Show) -> String {
+        show.cues
+            .iter()
+            .map(|c| match c.parent {
+                Some(_) => format!("[{}]", c.name),
+                None => c.name.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn ctrl() -> egui::Modifiers {
+        egui::Modifiers::COMMAND
+    }
+
+    #[test]
+    fn ctrl_click_adds_and_removes_cues_and_shift_click_takes_a_run() {
+        let mut show = listed();
+        assert_eq!(names(&show), "a G [b] [c] d e");
+        let mut m = ListMouse::new();
+        let mut st = UiState::default();
+        let id = |show: &Show, n: &str| show.cues.iter().find(|c| c.name == n).unwrap().id;
+        m.click(&mut show, &mut st, "a", Default::default());
+        assert_eq!(st.selection(&show), vec![id(&show, "a")]);
+        m.click(&mut show, &mut st, "d", ctrl());
+        assert_eq!(st.selection(&show), vec![id(&show, "a"), id(&show, "d")]);
+        m.click(&mut show, &mut st, "c", ctrl());
+        assert_eq!(
+            st.selection(&show),
+            vec![id(&show, "a"), id(&show, "c"), id(&show, "d")],
+            "in the order of the list"
+        );
+        assert_eq!(st.selected, Some(id(&show, "c")), "the last one clicked");
+        // Ctrl-click again takes it out.
+        m.click(&mut show, &mut st, "a", ctrl());
+        assert_eq!(st.selection(&show), vec![id(&show, "c"), id(&show, "d")]);
+        // A plain click goes back to one.
+        m.click(&mut show, &mut st, "e", Default::default());
+        assert_eq!(st.selection(&show), vec![id(&show, "e")]);
+        // Shift-click takes everything between, in the rows as they are shown.
+        m.click(&mut show, &mut st, "a", Default::default());
+        m.click(&mut show, &mut st, "c", egui::Modifiers::SHIFT);
+        let want: Vec<CueId> = ["a", "G", "b", "c"].iter().map(|n| id(&show, n)).collect();
+        assert_eq!(st.selection(&show), want);
+        // Choosing a cue some other way ends it too.
+        st.selected = Some(id(&show, "e"));
+        assert_eq!(st.selection(&show), vec![id(&show, "e")]);
+    }
+
+    #[test]
+    fn a_change_in_the_inspector_is_made_in_every_selected_cue() {
+        let mut show = Show::default();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let mut c = show.make_cue(CueType::Wait, None, show.cues.len());
+            c.name = format!("wait {}", ids.len());
+            ids.push(c.id);
+            show.cues.push(c);
+        }
+        let (mut e, mut st) = (Engine::for_tests(), UiState::default());
+        st.select_many(ids.clone(), ids[2]);
+        let before = show.cue(ids[2]).unwrap().clone();
+        // What the inspector does to the cue it shows.
+        let i = show.cue_index(ids[2]).unwrap();
+        if let CueKind::Wait(w) = &mut show.cues[i].kind {
+            w.duration = 9.0;
+        }
+        show.cues[i].pre_wait = 1.5;
+        let picked = st.selection(&show);
+        spread_edit(&mut show, &before, &picked);
+        for id in &ids {
+            let c = show.cue(*id).unwrap();
+            assert!(matches!(&c.kind, CueKind::Wait(w) if w.duration == 9.0));
+            assert_eq!(c.pre_wait, 1.5);
+        }
+        let names: Vec<&str> = show.cues.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["wait 0", "wait 1", "wait 2"], "names stay");
+        // The inspector draws with several cues picked, and with one.
+        let ctx = egui::Context::default();
+        for picked in [3, 1] {
+            if picked == 1 {
+                st.selected = Some(ids[0]);
+            }
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(700.0, 700.0))),
+                time: Some(1.0),
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let mut out = ctx.run_ui(input, |ui| {
+                inspector(ui, &mut show, &mut e, &mut st, &mut actions)
+            });
+            out.textures_delta.clear();
+            assert!(out.shapes.len() > 3);
+        }
+    }
+
+    #[test]
+    fn a_multiple_selection_does_not_come_back_with_another_show_or_a_playhead_that_returns() {
+        let mut e = Engine::for_tests();
+        let mut st = UiState::default();
+        let mut show = listed();
+        let id = |show: &Show, n: &str| show.cues.iter().find(|c| c.name == n).unwrap().id;
+        st.select_many(
+            vec![id(&show, "a"), id(&show, "d"), id(&show, "e")],
+            id(&show, "a"),
+        );
+        assert_eq!(st.selection(&show).len(), 3);
+        // Another show whose first cue has the same id as the one that was selected.
+        let other = listed();
+        assert_eq!(
+            other.cues[0].id, show.cues[0].id,
+            "ids start from the same number"
+        );
+        load_into(other, None, &mut show, &mut e, &mut st);
+        assert_eq!(st.selection(&show).len(), 1, "one cue, not the old three");
+        // The selection moves away and back to the same cue.
+        st.select_many(
+            vec![id(&show, "a"), id(&show, "d"), id(&show, "e")],
+            id(&show, "a"),
+        );
+        st.selected = Some(id(&show, "e"));
+        apply(Action::Move(0), &mut show, &mut e, &mut st);
+        st.selected = Some(id(&show, "a"));
+        assert_eq!(st.selection(&show).len(), 1, "the three are not back");
+        // Undo does not keep one either.
+        st.select_many(vec![id(&show, "a"), id(&show, "d")], id(&show, "a"));
+        let json = serde_json::to_string(&show).unwrap();
+        restore(&json, &mut show, &mut e, &mut st);
+        assert_eq!(st.selection(&show).len(), 1);
+    }
+
+    #[test]
+    fn the_cue_menu_acts_on_the_cue_clicked_and_keeps_a_selection_it_is_opened_in() {
+        let show = listed();
+        let id = |n: &str| show.cues.iter().find(|c| c.name == n).unwrap().id;
+        let ctx = egui::Context::default();
+        let menu = |c: &Cue, picked: &[CueId]| {
+            let mut actions = Vec::new();
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600.0, 800.0))),
+                time: Some(1.0),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                cue_context_menu(ui, c, &[], &[], false, picked, &mut actions)
+            });
+            out.textures_delta.clear();
+            actions
+        };
+        let d = show.cue(id("d")).unwrap();
+        // Opened on a cue of the selection: nothing reselects.
+        let kept = menu(d, &[id("a"), id("d"), id("e")]);
+        assert!(!kept.iter().any(|a| matches!(a, Action::Select(_))));
+        // Opened on another cue: that one is selected.
+        let moved = menu(d, &[id("a"), id("e")]);
+        assert!(
+            moved
+                .iter()
+                .any(|a| matches!(a, Action::Select(c) if *c == id("d")))
+        );
+        // Fire, Fade out and Stop name the cue clicked, not the one selected.
+        let src = include_str!("ui.rs");
+        for (label, aim) in [
+            ("▶ Fire", "Action::FireCue(c.id)"),
+            ("Fade out", "Action::FadeOutCue(c.id)"),
+            ("⏹ Stop", "Action::StopCue(c.id)"),
+        ] {
+            let at = src
+                .find(&format!("ui.button(\"{label}\").clicked()"))
+                .unwrap();
+            assert!(src[at..at + 120].contains(aim), "{label}");
+        }
+    }
+
+    #[test]
+    fn copying_cues_puts_some_text_on_the_system_clipboard_so_a_paste_arrives() {
+        let ctx = egui::Context::default();
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+            events: vec![Event::Copy],
+            ..Default::default()
+        };
+        let st = UiState::default();
+        let mut actions = Vec::new();
+        let mut out = ctx.run_ui(input, |ui| {
+            keyboard(ui.ctx(), &Show::default(), &st, &mut actions)
+        });
+        out.textures_delta.clear();
+        assert!(matches!(actions[..], [Action::Copy]));
+        assert!(
+            out.platform_output
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if !t.is_empty())),
+            "nothing was put on the clipboard"
+        );
+    }
+
+    #[test]
+    fn right_clicking_selected_cues_keeps_them_selected_and_groups_them_together() {
+        let mut m = ListMouse::new();
+        let mut st = UiState::default();
+        let mut show = listed();
+        assert_eq!(names(&show), "a G [b] [c] d e");
+        m.click(&mut show, &mut st, "a", Default::default());
+        m.click(&mut show, &mut st, "d", ctrl());
+        m.click(&mut show, &mut st, "e", ctrl());
+        let at = m.row(&mut show, &mut st, "d").center() + vec2(40.0, 0.0);
+        let right = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        m.frame(&mut show, &mut st, vec![Event::PointerMoved(at)]);
+        m.frame(&mut show, &mut st, vec![right(true)]);
+        m.frame(&mut show, &mut st, vec![right(false)]);
+        for _ in 0..3 {
+            m.frame(&mut show, &mut st, vec![]);
+        }
+        assert_eq!(
+            st.selection(&show).len(),
+            3,
+            "the menu is open and nothing was reselected"
+        );
+        // A cue outside the selection is selected on its own by a right click.
+        let at = m.row(&mut show, &mut st, "b").center() + vec2(40.0, 0.0);
+        let right = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        m.frame(&mut show, &mut st, vec![Event::PointerMoved(at)]);
+        m.frame(&mut show, &mut st, vec![right(true)]);
+        m.frame(&mut show, &mut st, vec![right(false)]);
+        for _ in 0..3 {
+            m.frame(&mut show, &mut st, vec![]);
+        }
+        assert_eq!(st.selection(&show).len(), 1);
+
+        // Group the three: one new group, in place of the first.
+        let (mut e, mut st) = (Engine::for_tests(), UiState::default());
+        let mut show = listed();
+        let id = |show: &Show, n: &str| show.cues.iter().find(|c| c.name == n).unwrap().id;
+        st.select_many(
+            vec![id(&show, "a"), id(&show, "d"), id(&show, "e")],
+            id(&show, "d"),
+        );
+        apply(Action::GroupCue(id(&show, "d")), &mut show, &mut e, &mut st);
+        assert_eq!(names(&show), "Group of a [a] [d] [e] G [b] [c]");
+        assert_eq!(st.selection(&show).len(), 1, "the new group is selected");
+
+        // Move them into the group that was there.
+        let mut show = listed();
+        let g = id(&show, "G");
+        st.select_many(vec![id(&show, "a"), id(&show, "e")], id(&show, "e"));
+        apply(
+            Action::MoveIntoGroup(id(&show, "e"), g),
+            &mut show,
+            &mut e,
+            &mut st,
+        );
+        assert_eq!(names(&show), "G [b] [c] [a] [e] d");
+        assert_eq!(st.selection(&show).len(), 2, "still selected");
+    }
+
+    #[test]
+    fn delete_duplicate_arm_and_move_work_on_everything_selected() {
+        let mut show = listed();
+        let mut m = ListMouse::new();
+        let (mut e, mut st) = (Engine::for_tests(), UiState::default());
+        m.click(&mut show, &mut st, "a", Default::default());
+        m.click(&mut show, &mut st, "d", ctrl());
+        apply(Action::ToggleArmed, &mut show, &mut e, &mut st);
+        let armed = |show: &Show, n: &str| show.cues.iter().find(|c| c.name == n).unwrap().armed;
+        assert!(!armed(&show, "a") && !armed(&show, "d") && armed(&show, "e"));
+        apply(Action::ToggleArmed, &mut show, &mut e, &mut st);
+        assert!(armed(&show, "a") && armed(&show, "d"));
+        // Moving down takes both a step.
+        apply(Action::Move(1), &mut show, &mut e, &mut st);
+        assert_eq!(names(&show), "G [b] [c] a e d");
+        assert_eq!(st.selection(&show).len(), 2, "still both selected");
+        // At the end of the list the last can't move, and neither does the rest.
+        apply(Action::Move(1), &mut show, &mut e, &mut st);
+        // At the end of the list the last can't move, and so nothing else does.
+        assert_eq!(names(&show), "G [b] [c] a e d");
+        // Duplicate: a copy of each, and the copies are what is selected.
+        apply(Action::Duplicate, &mut show, &mut e, &mut st);
+        assert_eq!(show.cues.len(), 8);
+        assert_eq!(st.selection(&show).len(), 2);
+        // Delete takes them all.
+        apply(Action::Delete, &mut show, &mut e, &mut st);
+        assert_eq!(names(&show), "G [b] [c] a e d");
+        assert_eq!(st.selection(&show).len(), 1, "one cue is left selected");
+        // A group and its child together: deleted once, nothing else lost.
+        m.click(&mut show, &mut st, "G", Default::default());
+        m.click(&mut show, &mut st, "b", ctrl());
+        apply(Action::Delete, &mut show, &mut e, &mut st);
+        assert_eq!(names(&show), "a e d");
+    }
+
+    #[test]
+    fn dragging_a_cue_reorders_the_list_or_drops_it_into_a_group() {
+        let mut m = ListMouse::new();
+        let mut st = UiState::default();
+        // Onto the top half of a row: before it.
+        let mut show = listed();
+        m.drag(&mut show, &mut st, "e", "a", 0.2);
+        assert_eq!(names(&show), "e a G [b] [c] d");
+        // Onto the lower half of the last row: after it.
+        m.drag(&mut show, &mut st, "e", "d", 0.8);
+        assert_eq!(names(&show), "a G [b] [c] d e");
+        // Onto the middle of a group: into it, at the end; the group opens.
+        let mut show = listed();
+        m.drag(&mut show, &mut st, "d", "G", 0.5);
+        assert_eq!(names(&show), "a G [b] [c] [d] e");
+        // Dropped by a child, a cue joins the group there.
+        let mut show = listed();
+        m.drag(&mut show, &mut st, "a", "c", 0.2);
+        assert_eq!(names(&show), "G [b] [a] [c] d e");
+        // And dragged out of a group to a top-level row, it leaves.
+        let mut show = listed();
+        m.drag(&mut show, &mut st, "b", "e", 0.8);
+        assert_eq!(names(&show), "a G [c] d e b");
+        // Dragging a cue of a selection takes the whole selection.
+        let mut show = listed();
+        m.click(&mut show, &mut st, "a", Default::default());
+        m.click(&mut show, &mut st, "d", ctrl());
+        m.drag(&mut show, &mut st, "a", "G", 0.5);
+        assert_eq!(names(&show), "G [b] [c] [a] [d] e");
+        assert_eq!(st.selection(&show).len(), 2, "they stay selected");
+        // A cue not in the selection goes alone, and becomes the selection.
+        let mut show = listed();
+        m.click(&mut show, &mut st, "a", Default::default());
+        m.click(&mut show, &mut st, "d", ctrl());
+        m.drag(&mut show, &mut st, "e", "a", 0.2);
+        assert_eq!(names(&show), "e a G [b] [c] d");
+        assert_eq!(st.selection(&show).len(), 1);
+        // A group isn't put into a group; dropping it on one goes beside it.
+        let mut show = listed();
+        m.drag(&mut show, &mut st, "G", "e", 0.8);
+        assert_eq!(names(&show), "a d e G [b] [c]");
+        // Show mode can't be dragged.
+        let mut show = listed();
+        st.show_mode = true;
+        m.drag(&mut show, &mut st, "e", "a", 0.2);
+        assert_eq!(names(&show), "a G [b] [c] d e");
+        st.show_mode = false;
+        // And a search, which hides most of the list, can't either.
+        st.cue_filter = "wait".into();
+        m.drag(&mut show, &mut st, "e", "a", 0.2);
+        assert_eq!(names(&show), "a G [b] [c] d e");
     }
 
     #[test]

@@ -423,7 +423,11 @@ const MAX_CUES: usize = 40;
 fn routes_picture(k: &CueKind) -> bool {
     matches!(
         k,
-        CueKind::Video(_) | CueKind::Image(_) | CueKind::Text(_) | CueKind::Camera(_)
+        CueKind::Video(_)
+            | CueKind::Image(_)
+            | CueKind::Text(_)
+            | CueKind::Shape(_)
+            | CueKind::Camera(_)
     )
 }
 

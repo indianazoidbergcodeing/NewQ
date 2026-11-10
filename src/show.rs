@@ -1245,6 +1245,7 @@ pub enum CueKind {
     Wait(WaitCue),
     Group(GroupCue),
     Text(TextCue),
+    Shape(ShapeCue),
     Camera(CameraCue),
     Send(SendCue),
     LiveAudio(LiveAudioCue),
@@ -1262,6 +1263,7 @@ pub enum CueType {
     Wait,
     Group,
     Text,
+    Shape,
     Camera,
     Send,
     LiveAudio,
@@ -1285,6 +1287,7 @@ impl CueType {
             CueType::Wait => "Wait",
             CueType::Group => "Group",
             CueType::Text => "Text",
+            CueType::Shape => "Shape",
             CueType::Camera => "Camera",
             CueType::Send => "Send",
             CueType::LiveAudio => "Live audio",
@@ -1304,6 +1307,7 @@ impl CueType {
             CueType::Wait => "⏱",
             CueType::Group => "📁",
             CueType::Text => "📝",
+            CueType::Shape => "🔷",
             CueType::Camera => "📷",
             CueType::Send => "📡",
             CueType::LiveAudio => "🎙",
@@ -1326,6 +1330,7 @@ impl CueKind {
             CueKind::Wait(_) => CueType::Wait,
             CueKind::Group(_) => CueType::Group,
             CueKind::Text(_) => CueType::Text,
+            CueKind::Shape(_) => CueType::Shape,
             CueKind::Camera(_) => CueType::Camera,
             CueKind::Send(_) => CueType::Send,
             CueKind::LiveAudio(_) => CueType::LiveAudio,
@@ -1339,8 +1344,18 @@ impl CueKind {
         match self {
             CueKind::Video(m) | CueKind::Image(m) | CueKind::Audio(m) => Some(m),
             CueKind::Text(t) => Some(&t.media),
+            CueKind::Shape(s) => Some(&s.media),
             CueKind::Camera(c) => Some(&c.media),
             CueKind::LiveAudio(c) => Some(&c.media),
+            _ => None,
+        }
+    }
+    /// The cue a fade, stop or control cue aims at.
+    pub fn target_mut(&mut self) -> Option<&mut Option<CueId>> {
+        match self {
+            CueKind::Fade(f) => Some(&mut f.target),
+            CueKind::Stop(s) => Some(&mut s.target),
+            CueKind::Control(c) => Some(&mut c.target),
             _ => None,
         }
     }
@@ -1348,6 +1363,7 @@ impl CueKind {
         match self {
             CueKind::Video(m) | CueKind::Image(m) | CueKind::Audio(m) => Some(m),
             CueKind::Text(t) => Some(&mut t.media),
+            CueKind::Shape(s) => Some(&mut s.media),
             CueKind::Camera(c) => Some(&mut c.media),
             CueKind::LiveAudio(c) => Some(&mut c.media),
             _ => None,
@@ -2353,6 +2369,88 @@ pub struct TextCue {
     pub media: MediaCue,
 }
 
+/// The solid shapes a shape cue can draw.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShapeKind {
+    #[default]
+    Square,
+    Rectangle,
+    Circle,
+    Oval,
+    Star,
+}
+
+impl ShapeKind {
+    pub const ALL: [ShapeKind; 5] = [
+        ShapeKind::Square,
+        ShapeKind::Rectangle,
+        ShapeKind::Circle,
+        ShapeKind::Oval,
+        ShapeKind::Star,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShapeKind::Square => "Square",
+            ShapeKind::Rectangle => "Rectangle",
+            ShapeKind::Circle => "Circle",
+            ShapeKind::Oval => "Oval",
+            ShapeKind::Star => "Star",
+        }
+    }
+
+    /// Whether the shape has a width of its own. A square, circle or star is as
+    /// wide as it is tall.
+    pub fn has_width(self) -> bool {
+        matches!(self, ShapeKind::Rectangle | ShapeKind::Oval)
+    }
+}
+
+fn default_star_points() -> u8 {
+    5
+}
+
+fn is_five(p: &u8) -> bool {
+    *p == 5
+}
+
+/// A solid shape drawn on an output: a square, rectangle, circle, oval or
+/// star in a colour. It plays like an image cue (its `media` holds the
+/// output, layer, transition, fades and hold time, and its geometry moves
+/// and scales it), with the picture drawn instead of read from a file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ShapeCue {
+    pub shape: ShapeKind,
+    /// Straight (not premultiplied) RGBA.
+    pub color: [u8; 4],
+    /// Width as a fraction of the output's height (a rectangle or oval).
+    pub width: f32,
+    /// Height as a fraction of the output's height (also the size of a square,
+    /// circle or star).
+    pub height: f32,
+    /// How many points a star has.
+    #[serde(default = "default_star_points", skip_serializing_if = "is_five")]
+    pub points: u8,
+    pub media: MediaCue,
+}
+
+impl ShapeCue {
+    pub fn new(output: Option<OutputId>) -> ShapeCue {
+        let mut media = MediaCue::new(PathBuf::new(), output);
+        media.fit = Fit::Stretch;
+        media.fade_in = 0.5;
+        media.fade_out = 0.5;
+        ShapeCue {
+            shape: ShapeKind::Square,
+            color: [255, 255, 255, 255],
+            width: 0.6,
+            height: 0.4,
+            points: 5,
+            media,
+        }
+    }
+}
+
 /// What a text cue shows. A live source replaces `{time}` in the cue's text
 /// with the time (or is the whole text when there is no `{time}`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -3348,6 +3446,10 @@ impl Show {
             CueType::Wait => ("Wait".into(), CueKind::Wait(WaitCue { duration: 5.0 })),
             CueType::Group => ("Group".into(), CueKind::Group(GroupCue::default())),
             CueType::Text => ("Text".into(), CueKind::Text(TextCue::new(default_output))),
+            CueType::Shape => (
+                "Shape".into(),
+                CueKind::Shape(ShapeCue::new(default_output)),
+            ),
             CueType::Clock => (
                 "Clock".into(),
                 CueKind::Text(TextCue::clock(default_output)),
@@ -3972,6 +4074,163 @@ impl Show {
         first
     }
 
+    /// The cues to copy for `ids`: each one, a group with its children, in the
+    /// order of the show (a child whose group is copied too isn't added again).
+    pub fn copy_cues(&self, ids: &[CueId]) -> Vec<Cue> {
+        let mut out: Vec<Cue> = Vec::new();
+        let mut i = 0;
+        while i < self.cues.len() {
+            let c = &self.cues[i];
+            let end = self.block_end(i);
+            let group_picked = ids.contains(&c.id);
+            if group_picked && self.is_group(i) {
+                out.extend_from_slice(&self.cues[i..end]);
+                i = end;
+                continue;
+            }
+            if group_picked {
+                out.push(c.clone());
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Put copies of `cues` (from `copy_cues`, of this show or another) in the
+    /// list `list`, where a new cue goes when `selected` is selected (see
+    /// `insert_slot`): they get new ids and numbers, and a hotkey or note is
+    /// left off as with a duplicate. A display or audio output this show
+    /// doesn't have is replaced by its first (or the default).
+    ///
+    /// A fade, stop or control cue that aims at one of the cues pasted aims at
+    /// its copy. One that aims at another cue keeps its aim when the cues are
+    /// from this show (`same_show`) and loses it when they are from another,
+    /// where the numbers mean other cues. With `keep_ids` (what was cut is being
+    /// put back) the cues keep their ids if nothing else has them, so what aimed
+    /// at them still does.
+    ///
+    /// Returns the ids of the cues pasted (a group, not its children).
+    pub fn paste_cues(
+        &mut self,
+        cues: &[Cue],
+        selected: Option<CueId>,
+        list: u32,
+        same_show: bool,
+        keep_ids: bool,
+    ) -> Vec<CueId> {
+        // A group is followed by its children; a child on its own pastes as a cue.
+        let mut blocks: Vec<Vec<Cue>> = Vec::new();
+        for c in cues {
+            match (c.parent, blocks.last_mut()) {
+                (Some(p), Some(b)) if b[0].id == p && matches!(b[0].kind, CueKind::Group(_)) => {
+                    b.push(c.clone())
+                }
+                _ => blocks.push(vec![c.clone()]),
+            }
+        }
+        let Some(first) = blocks.first() else {
+            return Vec::new();
+        };
+        let slot = self.insert_slot(selected, matches!(first[0].kind, CueKind::Group(_)), list);
+        let (at, mut parent) = (slot.at.min(self.cues.len()), slot.parent);
+        // Where a group goes when the cues start inside a group: after that group.
+        let after_group = parent
+            .and_then(|g| self.cue_index(g))
+            .map(|gi| self.block_end(gi));
+        let mut number: i64 = self.next_cue_number().parse().unwrap_or(1);
+        // New ids, by the id the cue had.
+        let mut renamed: std::collections::HashMap<CueId, CueId> = std::collections::HashMap::new();
+        let mut heads = Vec::new();
+        let (mut inside, mut after) = (Vec::new(), Vec::new());
+        for mut block in blocks {
+            let is_group = matches!(block[0].kind, CueKind::Group(_));
+            // Groups don't nest: it goes after the group that was being filled.
+            if is_group {
+                parent = None;
+            }
+            let run = if parent.is_some() {
+                &mut inside
+            } else {
+                &mut after
+            };
+            let mut new_group = None;
+            for (n, c) in block.iter_mut().enumerate() {
+                let old = c.id;
+                c.id = if keep_ids
+                    && self.cue(old).is_none()
+                    && !renamed.values().any(|v| *v == old)
+                {
+                    self.next_id = self.next_id.max(old.0 + 1);
+                    old
+                } else {
+                    CueId(self.alloc_id())
+                };
+                renamed.insert(old, c.id);
+                c.number = number.to_string();
+                number += 1;
+                c.hotkey = None;
+                c.midi_note = None;
+                c.list = list;
+                if n == 0 {
+                    heads.push(c.id);
+                    c.parent = if is_group { None } else { parent };
+                    new_group = is_group.then_some(c.id);
+                } else {
+                    c.parent = new_group;
+                }
+                if let Some(m) = c.kind.media_mut() {
+                    if m.output.is_some_and(|o| self.output(o).is_none()) {
+                        m.output = self.outputs.first().map(|o| o.id);
+                    }
+                    if m.audio_output
+                        .is_some_and(|a| !self.audio_outputs.iter().any(|o| o.id == a))
+                    {
+                        m.audio_output = None;
+                    }
+                }
+            }
+            run.extend(block);
+        }
+        // What the pasted cues aim at.
+        for c in inside.iter_mut().chain(after.iter_mut()) {
+            if let Some(target) = c.kind.target_mut() {
+                *target = match *target {
+                    Some(t) if renamed.contains_key(&t) => Some(renamed[&t]),
+                    Some(_) if !same_show => None,
+                    other => other,
+                };
+            }
+        }
+        // The run after the group first, so the other's place doesn't move.
+        let inside_len = inside.len();
+        if !after.is_empty() {
+            let place = after_group.unwrap_or(at + inside_len);
+            self.cues.splice(place..place, after);
+        }
+        self.cues.splice(at..at, inside);
+        debug_assert!(inside_len <= self.cues.len());
+        heads
+    }
+
+    /// Remove the cues `ids` in one pass (a group goes with its children).
+    /// Returns where the first of them was and the ids removed.
+    pub fn delete_many(&mut self, ids: &[CueId]) -> Option<(usize, Vec<CueId>)> {
+        let gone: std::collections::HashSet<CueId> = ids.iter().copied().collect();
+        let first = self.cues.iter().position(|c| gone.contains(&c.id))?;
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.cues.len());
+        for c in std::mem::take(&mut self.cues) {
+            let out = gone.contains(&c.id) || c.parent.is_some_and(|p| gone.contains(&p));
+            if out {
+                removed.push(c.id);
+            } else {
+                kept.push(c);
+            }
+        }
+        self.cues = kept;
+        Some((first, removed))
+    }
+
     /// Remove the cue at `idx`; a group goes with its children. Returns the
     /// ids removed.
     pub fn delete(&mut self, idx: usize) -> Vec<CueId> {
@@ -4164,6 +4423,38 @@ impl Show {
         Some(gid)
     }
 
+    /// Wrap the cues `ids` in one new group, where the first of them is. Groups
+    /// can't be inside a group, so any group among `ids` is left out, and the
+    /// cues must be in the first one's list. The first cue's timing goes to the
+    /// group (as with `group_cue`). Returns the new group, or None if no cue could
+    /// be put in one.
+    pub fn group_cues(&mut self, ids: &[CueId]) -> Option<CueId> {
+        let mut picked: Vec<CueId> = self
+            .cues
+            .iter()
+            .filter(|c| ids.contains(&c.id) && !matches!(c.kind, CueKind::Group(_)))
+            .map(|c| c.id)
+            .collect();
+        let list = self.cue(*picked.first()?)?.list;
+        picked.retain(|&id| self.cue(id).is_some_and(|c| c.list == list));
+        let first = picked[0];
+        // One that is inside another group comes out of it first.
+        let i = self.cue_index(first)?;
+        if self.cues[i].parent.is_some() {
+            self.move_out(i);
+        }
+        let group = self.group_cue(self.cue_index(first)?)?;
+        for &id in &picked[1..] {
+            let mut i = self.cue_index(id)?;
+            if self.cues[i].parent.is_some() {
+                self.move_out(i);
+                i = self.cue_index(id)?;
+            }
+            self.move_into(i, group);
+        }
+        Some(group)
+    }
+
     /// Dissolve the group at `idx`; its children become top-level cues.
     pub fn ungroup(&mut self, idx: usize) {
         if !self.is_group(idx) {
@@ -4260,6 +4551,92 @@ impl Show {
             Some(at)
         }
     }
+
+    /// Move cues to where they were dropped: before or after another cue, or
+    /// into the end of a group. A group goes with its children and a child
+    /// whose group is moving too stays in it. Dropped next to a child, a cue
+    /// joins that group (a group can't, so it goes beside the group instead);
+    /// dropped into a group, groups are left where they are. The cues take the
+    /// list of the cue they are dropped by. Returns whether anything moved
+    /// (false for a target that is itself being moved, or one that is gone).
+    pub fn move_cues(&mut self, ids: &[CueId], at: DropAt) -> bool {
+        let want: std::collections::HashSet<CueId> = ids.iter().copied().collect();
+        let target = match at {
+            DropAt::Before(t) | DropAt::After(t) | DropAt::Into(t) => t,
+        };
+        let Some(ti) = self.cue_index(target) else {
+            return false;
+        };
+        let into = matches!(at, DropAt::Into(_));
+        if into && !self.is_group(ti) {
+            return false;
+        }
+        // The cues that lead: those not carried along by a group that moves.
+        let heads: Vec<usize> = (0..self.cues.len())
+            .filter(|&i| {
+                let c = &self.cues[i];
+                want.contains(&c.id)
+                    && !c.parent.is_some_and(|p| want.contains(&p))
+                    && !(into && matches!(c.kind, CueKind::Group(_)))
+            })
+            .collect();
+        // A cue can't be put inside, or next to, itself.
+        if heads.is_empty()
+            || heads
+                .iter()
+                .any(|&h| h == ti || (h == self.top_index(ti) && self.is_group(h)))
+        {
+            return false;
+        }
+        let with_a_group = heads.iter().any(|&h| self.is_group(h));
+        let mut moving: Vec<Cue> = Vec::new();
+        let mut lead: std::collections::HashSet<CueId> = std::collections::HashSet::new();
+        for &h in &heads {
+            lead.insert(self.cues[h].id);
+            moving.extend_from_slice(&self.cues[h..self.block_end(h)]);
+        }
+        let gone: std::collections::HashSet<CueId> = moving.iter().map(|c| c.id).collect();
+        self.cues.retain(|c| !gone.contains(&c.id));
+        let Some(ti) = self.cue_index(target) else {
+            return false;
+        };
+        let list = self.cues[ti].list;
+        let beside = self.cues[ti].parent;
+        // (where, which group they join)
+        let (place, parent) = match at {
+            DropAt::Into(_) => (self.block_end(ti), Some(target)),
+            DropAt::Before(_) => match beside {
+                Some(p) if with_a_group => (self.cue_index(p).unwrap_or(ti), None),
+                Some(p) => (ti, Some(p)),
+                None => (ti, None),
+            },
+            DropAt::After(_) => match beside {
+                Some(p) if with_a_group => {
+                    let g = self.cue_index(p).unwrap_or(ti);
+                    (self.block_end(g), None)
+                }
+                Some(p) => (ti + 1, Some(p)),
+                None => (self.block_end(ti), None),
+            },
+        };
+        for c in &mut moving {
+            c.list = list;
+            if lead.contains(&c.id) && !matches!(c.kind, CueKind::Group(_)) {
+                c.parent = parent;
+            }
+        }
+        self.cues.splice(place..place, moving);
+        true
+    }
+}
+
+/// Where cues are dropped (see `Show::move_cues`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropAt {
+    Before(CueId),
+    After(CueId),
+    /// Into the end of this group.
+    Into(CueId),
 }
 
 pub fn db_to_gain(db: f32) -> f32 {
@@ -5073,6 +5450,365 @@ mod tests {
         // After a child: next to it, in its group; a new group goes after the group.
         assert_eq!(slot(Some(b), false), (3, Some(g)));
         assert_eq!(slot(Some(c), true), (4, None));
+    }
+
+    fn id_of(show: &Show, name: &str) -> CueId {
+        show.cues.iter().find(|c| c.name == name).unwrap().id
+    }
+
+    #[test]
+    fn dropping_cues_moves_them_and_joins_groups() {
+        // Before and after another cue, several at once, in their list order.
+        let mut show = grouped();
+        let (a, d) = (id_of(&show, "a"), id_of(&show, "d"));
+        let g = id_of(&show, "1");
+        assert!(show.move_cues(&[d, a], DropAt::After(g)));
+        assert_eq!(
+            layout(&show),
+            "G1: [b] [c] a d",
+            "they keep their own order"
+        );
+        let mut show = grouped();
+        assert!(show.move_cues(&[a], DropAt::After(d)));
+        assert_eq!(layout(&show), "G1: [b] [c] d a");
+        let mut show = grouped();
+        assert!(show.move_cues(&[d], DropAt::Before(a)));
+        assert_eq!(layout(&show), "d a G1: [b] [c]");
+        // A group takes its children along; a selected child of it stays in it.
+        let mut show = grouped();
+        let (g, b) = (id_of(&show, "1"), id_of(&show, "b"));
+        assert!(show.move_cues(&[g, b], DropAt::After(d)));
+        assert_eq!(layout(&show), "a d G1: [b] [c]");
+        // Into a group: at its end.
+        let mut show = grouped();
+        assert!(show.move_cues(&[a, d], DropAt::Into(g)));
+        assert_eq!(layout(&show), "G1: [b] [c] [a] [d]");
+        // Dropped by a child, a cue joins its group; a group goes beside the group.
+        let mut show = grouped();
+        assert!(show.move_cues(&[a], DropAt::After(b)));
+        assert_eq!(layout(&show), "G1: [b] [a] [c] d");
+        let mut show = named("abcd");
+        let g = show.group_cue(3).unwrap();
+        let (b, c) = (id_of(&show, "b"), id_of(&show, "c"));
+        assert!(show.move_into(2, g));
+        assert_eq!(layout(&show), "a b GGroup of d: [d] [c]");
+        assert!(show.move_cues(&[b], DropAt::Before(c)));
+        assert_eq!(layout(&show), "a GGroup of d: [d] [b] [c]");
+        let a = id_of(&show, "a");
+        // A group dropped by one of its own children stays where it is.
+        assert!(!show.move_cues(&[g], DropAt::After(b)));
+        // Beside a child, a group goes beside the group, not into it.
+        let mut again = show.clone();
+        assert!(again.move_cues(&[a], DropAt::After(c)));
+        assert_eq!(layout(&again), "GGroup of d: [d] [b] [c] [a]");
+        let mut grouped_a = named("abc");
+        let ga = grouped_a.group_cue(0).unwrap();
+        let (b2, c2) = (id_of(&grouped_a, "b"), id_of(&grouped_a, "c"));
+        assert!(grouped_a.move_into(2, ga));
+        assert_eq!(layout(&grouped_a), "GGroup of a: [a] [b] c");
+        assert!(grouped_a.move_cues(&[c2], DropAt::Before(b2)));
+        assert_eq!(layout(&grouped_a), "GGroup of a: [a] [c] [b]");
+        assert!(show.move_cues(&[g], DropAt::Before(a)));
+        assert_eq!(layout(&show), "GGroup of d: [d] [b] [c] a");
+        // A child dropped by a top-level cue leaves its group.
+        let mut show = grouped();
+        assert!(show.move_cues(&[b], DropAt::After(d)));
+        assert_eq!(layout(&show), "a G1: [c] d b");
+    }
+
+    #[test]
+    fn shape_cues_are_saved_with_only_what_was_chosen() {
+        let mut show = Show::default();
+        let mut c = show.make_cue(CueType::Shape, None, 0);
+        assert_eq!(c.kind.cue_type(), CueType::Shape);
+        assert!(c.kind.media().is_some() && c.kind.file_media().is_none());
+        if let CueKind::Shape(s) = &mut c.kind {
+            s.shape = ShapeKind::Oval;
+            s.color = [1, 2, 3, 4];
+        }
+        show.cues.push(c);
+        let text = serde_json::to_string(&show).unwrap();
+        assert!(!text.contains("\"points\""), "five points is not written");
+        let back: Show = serde_json::from_str(&text).unwrap();
+        let CueKind::Shape(s) = &back.cues[0].kind else {
+            panic!("a shape");
+        };
+        assert_eq!(
+            (s.shape, s.color, s.points),
+            (ShapeKind::Oval, [1, 2, 3, 4], 5)
+        );
+        if let CueKind::Shape(s) = &mut show.cues[0].kind {
+            s.points = 7;
+        }
+        let back: Show = serde_json::from_str(&serde_json::to_string(&show).unwrap()).unwrap();
+        assert!(matches!(&back.cues[0].kind, CueKind::Shape(s) if s.points == 7));
+    }
+
+    #[test]
+    fn pasted_fades_and_stops_aim_at_the_copies_or_nothing_and_a_cut_comes_back_as_it_was() {
+        let mut show = named("abc");
+        let ids: Vec<CueId> = show.cues.iter().map(|c| c.id).collect();
+        // A stop cue aimed at "a", one aimed at "c" (outside what is copied).
+        let mut stop_a = show.make_cue(CueType::Stop, None, 0);
+        if let CueKind::Stop(s) = &mut stop_a.kind {
+            s.target = Some(ids[0]);
+        }
+        let mut stop_c = show.make_cue(CueType::Stop, None, 0);
+        if let CueKind::Stop(s) = &mut stop_c.kind {
+            s.target = Some(ids[2]);
+        }
+        let (sa, sc) = (stop_a.id, stop_c.id);
+        show.cues.push(stop_a);
+        show.cues.push(stop_c);
+        let aim = |show: &Show, id: CueId| match &show.cue(id).unwrap().kind {
+            CueKind::Stop(s) => s.target,
+            _ => panic!("a stop"),
+        };
+        // Copied with the cue it stops: the copy stops the copy.
+        let copied = show.copy_cues(&[ids[0], sa]);
+        let heads = show.paste_cues(&copied, None, 0, true, false);
+        assert_eq!(heads.len(), 2);
+        assert_eq!(
+            aim(&show, heads[1]),
+            Some(heads[0]),
+            "aims at the pasted copy"
+        );
+        // Copied without it: the same show keeps the aim, another show loses it.
+        let copied = show.copy_cues(&[sc]);
+        let same = show.paste_cues(&copied, None, 0, true, false);
+        assert_eq!(aim(&show, same[0]), Some(ids[2]));
+        let mut other = named("xyz");
+        let elsewhere = other.paste_cues(&copied, None, 0, false, false);
+        assert_eq!(
+            aim(&other, elsewhere[0]),
+            None,
+            "another show's cue 3 is not this one"
+        );
+        // A cut put back keeps its id, so what aimed at it still does.
+        let mut show = named("abc");
+        let ids: Vec<CueId> = show.cues.iter().map(|c| c.id).collect();
+        let mut stop = show.make_cue(CueType::Stop, None, 0);
+        if let CueKind::Stop(s) = &mut stop.kind {
+            s.target = Some(ids[1]);
+        }
+        let stop_id = stop.id;
+        show.cues.push(stop);
+        let cut = show.copy_cues(&[ids[1]]);
+        show.delete_many(&[ids[1]]);
+        let back = show.paste_cues(&cut, Some(ids[0]), 0, true, true);
+        assert_eq!(back, vec![ids[1]], "the same id");
+        assert_eq!(aim(&show, stop_id), Some(back[0]), "still aimed at it");
+        assert_eq!(layout(&show), "a b c Stop all");
+        // If something else has the id, it gets a new one.
+        let again = show.paste_cues(&cut, Some(ids[0]), 0, true, true);
+        assert_ne!(again[0], ids[1]);
+        let all: std::collections::HashSet<_> = show.cues.iter().map(|c| c.id).collect();
+        assert_eq!(all.len(), show.cues.len());
+        // Ids made later never collide with a kept one.
+        let fresh = show.alloc_id();
+        assert!(show.cues.iter().all(|c| c.id.0 != fresh));
+    }
+
+    #[test]
+    fn deleting_many_cues_takes_each_group_with_its_children_in_one_pass() {
+        let mut show = grouped();
+        let (a, g, b, d) = (
+            id_of(&show, "a"),
+            id_of(&show, "1"),
+            id_of(&show, "b"),
+            id_of(&show, "d"),
+        );
+        // The group and its child, and a: the child is not removed twice.
+        let (first, removed) = show.delete_many(&[g, b, a]).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(removed.len(), 4, "a, the group, b and c");
+        assert_eq!(layout(&show), "d");
+        assert!(show.cue(d).is_some());
+        assert!(show.delete_many(&[g]).is_none(), "nothing left to remove");
+        assert!(show.delete_many(&[]).is_none());
+    }
+
+    #[test]
+    fn several_cues_are_wrapped_in_one_group_where_the_first_is() {
+        // Top-level cues, even with others between them.
+        let mut show = named("abcde");
+        let ids: Vec<CueId> = show.cues.iter().map(|c| c.id).collect();
+        show.cues[1].pre_wait = 2.0;
+        let g = show.group_cues(&[ids[3], ids[1], ids[4]]).unwrap();
+        assert_eq!(layout(&show), "a GGroup of b: [b] [d] [e] c");
+        assert_eq!(
+            show.cue(g).unwrap().pre_wait,
+            2.0,
+            "the first's timing is the group's"
+        );
+        assert!(show.children(g).iter().all(|c| c.parent == Some(g)));
+        // A child of another group comes out of it; groups among them are left out.
+        let mut show = grouped();
+        let (a, g1, b, d) = (
+            id_of(&show, "a"),
+            id_of(&show, "1"),
+            id_of(&show, "b"),
+            id_of(&show, "d"),
+        );
+        let _group = show.group_cues(&[a, g1, b, d]).unwrap();
+        assert_eq!(layout(&show), "GGroup of a: [a] [b] [d] G1: [c]");
+        assert!(show.cue(g1).unwrap().parent.is_none());
+        // Nothing to group: only groups, or nothing.
+        let mut show = grouped();
+        let g1 = id_of(&show, "1");
+        assert!(show.group_cues(&[g1]).is_none());
+        assert!(show.group_cues(&[]).is_none());
+        assert_eq!(layout(&show), "a G1: [b] [c] d");
+        // A single cue is just wrapped, as before.
+        let a = id_of(&show, "a");
+        assert!(show.group_cues(&[a]).is_some());
+        assert_eq!(layout(&show), "GGroup of a: [a] G1: [b] [c] d");
+    }
+
+    #[test]
+    fn copied_cues_paste_with_new_ids_after_the_selected_cue_or_into_a_group() {
+        let mut show = grouped();
+        assert_eq!(layout(&show), "a G1: [b] [c] d");
+        let (a, g, b, d) = (
+            id_of(&show, "a"),
+            id_of(&show, "1"),
+            id_of(&show, "b"),
+            id_of(&show, "d"),
+        );
+        show.cue_mut(a).unwrap().hotkey = Some("F".into());
+        let copied = show.copy_cues(&[a]);
+        assert_eq!(copied.len(), 1);
+        // After a top-level cue.
+        let heads = show.paste_cues(&copied, Some(d), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [c] d a");
+        assert_eq!(heads.len(), 1);
+        let pasted = show.cue(heads[0]).unwrap();
+        assert!(pasted.id != a && pasted.hotkey.is_none() && pasted.parent.is_none());
+        assert_eq!(
+            show.cue(a).unwrap().hotkey.as_deref(),
+            Some("F"),
+            "the original keeps its key"
+        );
+        let ids: std::collections::HashSet<_> = show.cues.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), show.cues.len(), "every id is its own");
+        // Into a selected group: at its end; after a child: beside it.
+        let mut show = grouped();
+        let copied = show.copy_cues(&[a]);
+        show.paste_cues(&copied, Some(g), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [c] [a] d");
+        let mut show = grouped();
+        show.paste_cues(&copied, Some(b), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [a] [c] d");
+        // A group is copied with its children, and not twice when both are picked.
+        let c = show.copy_cues(&[b, g]);
+        assert_eq!(c.len(), 4, "the group, b, a (pasted) and c");
+        let mut show = grouped();
+        let copied = show.copy_cues(&[g, b]);
+        assert_eq!(copied.len(), 3);
+        // Pasted with a group selected, a group goes after it, not into it.
+        let heads = show.paste_cues(&copied, Some(g), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [c] G1: [b] [c] d");
+        assert_eq!(heads.len(), 1);
+        let new_group = show.cue(heads[0]).unwrap();
+        assert!(new_group.id != g);
+        assert_eq!(show.children(new_group.id).len(), 2, "its own children");
+        assert!(show.children(new_group.id).iter().all(|k| k.id != b));
+        // Several cues keep their order; a child on its own comes in as a cue.
+        let mut show = grouped();
+        let copied = show.copy_cues(&[d, a]);
+        assert_eq!(
+            copied.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["a", "d"]
+        );
+        show.paste_cues(&copied, Some(d), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [c] d a d");
+        let lone = show.copy_cues(&[b]);
+        show.paste_cues(&lone, Some(d), 0, true, false);
+        assert_eq!(layout(&show), "a G1: [b] [c] d b a d");
+        assert!(show.paste_cues(&[], Some(d), 0, true, false).is_empty());
+    }
+
+    #[test]
+    fn a_cue_pasted_into_another_show_gets_a_display_that_show_has() {
+        let mut from = Show::default();
+        let second = from.add_display();
+        let audio = from.add_audio_output();
+        let mut c = from.make_cue(CueType::Video, None, 0);
+        let m = c.kind.media_mut().unwrap();
+        m.output = Some(second);
+        m.audio_output = Some(audio);
+        let id = c.id;
+        from.cues.push(c);
+        let copied = from.copy_cues(&[id]);
+        let mut to = Show::default();
+        let only = to.outputs[0].id;
+        let heads = to.paste_cues(&copied, None, 0, false, false);
+        let m = to.cue(heads[0]).unwrap().kind.media().unwrap();
+        assert_eq!(m.output, Some(only));
+        assert_eq!(m.audio_output, None);
+        // Into its own show nothing is changed.
+        let again = from.paste_cues(&copied, Some(id), 0, true, false);
+        let m = from.cue(again[0]).unwrap().kind.media().unwrap();
+        assert_eq!((m.output, m.audio_output), (Some(second), Some(audio)));
+    }
+
+    #[test]
+    fn dropping_cues_where_they_cannot_go_changes_nothing() {
+        let mut show = grouped();
+        let (g, b, c) = (id_of(&show, "1"), id_of(&show, "b"), id_of(&show, "c"));
+        let other = show.group_cue(0).unwrap();
+        let before = layout(&show);
+        assert!(
+            !show.move_cues(&[other], DropAt::Into(g)),
+            "groups don't nest"
+        );
+        assert!(
+            !show.move_cues(&[g], DropAt::After(b)),
+            "not beside its own child"
+        );
+        assert!(!show.move_cues(&[b], DropAt::Before(b)));
+        assert!(!show.move_cues(&[g], DropAt::Into(g)));
+        assert!(!show.move_cues(&[c], DropAt::Into(b)), "b is not a group");
+        assert!(!show.move_cues(&[CueId(9999)], DropAt::After(b)));
+        assert!(!show.move_cues(&[c], DropAt::After(CueId(9999))));
+        assert!(!show.move_cues(&[], DropAt::After(b)));
+        assert_eq!(layout(&show), before);
+    }
+
+    #[test]
+    fn any_drop_keeps_every_cue_once_and_children_in_their_groups() {
+        let mut show = grouped();
+        let all: Vec<CueId> = show.cues.iter().map(|c| c.id).collect();
+        let picks = [
+            vec![all[0]],
+            vec![all[2], all[4]],
+            vec![all[1]],
+            vec![all[3], all[0]],
+            vec![all[1], all[2], all[4]],
+        ];
+        for &t in &all {
+            for at in [DropAt::Before(t), DropAt::After(t), DropAt::Into(t)] {
+                for pick in &picks {
+                    show.move_cues(pick, at);
+                    let mut now: Vec<u64> = show.cues.iter().map(|c| c.id.0).collect();
+                    now.sort();
+                    let mut was: Vec<u64> = all.iter().map(|c| c.0).collect();
+                    was.sort();
+                    assert_eq!(now, was);
+                    for (i, c) in show.cues.iter().enumerate() {
+                        if let Some(p) = c.parent {
+                            let g = show.cue_index(p).expect("a child's group exists");
+                            assert!(g < i && show.is_group(g), "{}", layout(&show));
+                            assert!(
+                                show.cues[g + 1..=i].iter().all(|k| k.parent == Some(p)),
+                                "{}",
+                                layout(&show)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
