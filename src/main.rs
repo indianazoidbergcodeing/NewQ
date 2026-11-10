@@ -7,6 +7,7 @@ mod bench;
 #[cfg(test)]
 mod blend;
 mod branding;
+mod bulk_edit;
 mod clicker;
 mod clock;
 mod color;
@@ -41,6 +42,7 @@ mod recovery;
 mod relink;
 mod remote;
 mod render;
+mod shape;
 mod show;
 mod slides_export;
 mod soak;

@@ -17,6 +17,104 @@ Pre-built binaries for Windows, Linux and macOS are on the
 [Releases page](https://github.com/r2a42/NewQ/releases). Every download
 includes FFmpeg, so there's nothing else to install.
 
+## What's new in this fork
+
+Everything this fork has added, newest version first.
+
+### 0.18.5
+
+- **Select several cues:** Ctrl-click (Cmd on a Mac) adds a cue to the selection
+  or takes it out; Shift-click selects a run. Delete, Duplicate, Ctrl+Up/Down and
+  arm/disarm work on all of them.
+- **Drag cues in the cue list:** drag one cue, or the whole selection, to
+  reorder; drop on the middle of a group to put it inside. The list scrolls when
+  you drag near its top or bottom.
+- **Copy, cut and paste cues:** Ctrl+C, Ctrl+X and Ctrl+V, also from the Edit
+  menu and the right-click menu. Groups go with their children, a paste can go
+  into another show, and a fade, stop or control cue is re-aimed at the copy.
+- **Right-click selected cues:** *Group the N selected cues* wraps them in one new
+  group; *Move N cues into group* puts them in a group that exists. Right-clicking
+  a selected cue keeps the selection.
+- **Layers:** every picture cue has a **Layer** number (-1000 to 1000). Layer 1 is
+  drawn over layer 0, 2 over 0 and 1, and a negative layer goes under 0. A cue
+  that cuts or crossfades in replaces only what is on its own layer of that
+  display, so cues on other layers keep playing.
+- **Shape cues:** *Cue ▸ Add Shape cue* draws a solid **square, rectangle,
+  circle, oval or star** in a colour you choose (with opacity), at the size you
+  set, and you can move and scale it like any other picture.
+- **Edit several cues at once:** with cues selected, a change in the inspector
+  (duration, pre-wait, fades, layer, volume, effects, arming…) is made in all of
+  them. Names, numbers, notes, hotkeys, files and text stay each cue's own.
+- **Changes apply while a cue plays:** layer, position, scale, rotation, crop,
+  colour, effects, opacity, volume, fit, the display, how long a picture is held,
+  and a shape's or text's own settings follow at once, with nothing to stop and
+  fire again.
+- **Groups:** in a *Play in order* group, a picture or video that crossfades in
+  now starts before the one before it ends, so the two fade across each other
+  instead of dipping to black. Cues of a *Start all together* group share their
+  display without replacing each other, and slide shows keep working as before.
+
+### 0.18.4
+
+- **Capture cards on Windows and Linux:** a camera cue set to *Automatic* now
+  names the format the device offers, which fixes capture cards such as the
+  Magewell USB Capture SDI that failed with "I/O error".
+- **Blackmagic output:** a display's *Send out* can go to a Blackmagic UltraStudio
+  or DeckLink output (for example an UltraStudio Express or Mini Monitor), which
+  does not show up as a display. Needs an FFmpeg built with DeckLink; not tried
+  on hardware.
+- **Recording:** a display's *Send out* can record the picture to a file: a
+  folder (Downloads by default), H.264 or H.265, MKV, MOV or MP4, a bitrate and
+  an optional area of the picture. Every start makes a new file named by the day
+  and time. MKV is the default, since the others can be left unplayable by a
+  sudden stop (the panel says so).
+- **Sound in recordings:** a recording can also take what one of the show's audio
+  outputs plays and write it with the picture.
+- **New interface (optional):** *Window ▸ New interface* swaps the panes for three
+  views: **Editor** (cue list and inspector), **Operator** (a big GO and what is
+  running) and **Patch** (cues, displays and audio outputs, where a drag from a
+  cue to a display or audio output routes it). Switch back any time; the show is
+  the same.
+
+### 0.18.3
+
+- **Choose the H.264 encoder by hand:** the streaming server section has an
+  Encoder list (Automatic, x264, VideoToolbox, NVENC, Quick Sync, AMF,
+  OpenH264), for when a hardware encoder passes the quick test and still sends a
+  stream a viewer can't show.
+- **AMD AMF fix:** it now sends a keyframe every two seconds instead of one for
+  the whole stream, so a viewer who joins late sees a picture.
+- **A stuck FFmpeg is ended:** a stream's FFmpeg that stopped answering no longer
+  keeps Stop from returning or stays running after NewQ is closed.
+
+### 0.18.2
+
+- **Streaming server locked down:** only this computer can send a picture to the
+  server it runs, anyone can watch, and a second sender can't take the stream
+  over. A chosen network adapter that isn't there no longer opens the server to
+  every adapter.
+- **Server runs on its own thread** and acts on a port change once you stop
+  typing; several displays running their own server agree on one adapter and
+  ports.
+- **Test server** says why a test failed (not started, nothing listening, no
+  answer) and waits longer.
+- **Plays in a browser:** video is sent without B-frames and WebRTC also listens
+  on TCP.
+- **No leftover servers:** the server ends with NewQ, even if NewQ crashes, and
+  one an earlier NewQ left behind is stopped; its output is kept in
+  `mediamtx.log`.
+- An empty server address is never treated as reachable.
+
+### 0.18.1
+
+- **Streaming server in NewQ:** in a display's *Send out* section, *Streaming
+  server (MediaMTX)* can run the server itself (*Run the server in NewQ*).
+- **Player link and QR code:** show the web player link and a QR code so phones
+  open the stream without typing the address.
+- **Network adapter:** choose which network connection the server listens on and
+  the links carry.
+- **Test server:** checks the server's ports.
+
 ## Code signing policy
 
 - **macOS:** the app is signed with an Apple Developer ID and notarised by Apple.
@@ -642,7 +740,46 @@ enter, and *Test Mode* downloads its free test media when you start it.
   collapsed in the cue list. Adding a cue while a group is selected puts it
   inside; *Wrap in group*, *Move into group* and *Move out of group* (cue
   menu or right-click) move cues in and out, and Ctrl+↑/↓ moves a cue within or
-  out of its group. Groups don't nest.
+  out of its group. Groups don't nest. In a *Play in order* group, a picture or
+  video that crossfades in starts that many seconds before the one before it ends,
+  and the two fade across each other (the earlier one doesn't fade to black
+  first); with a cut, a fade-in or a dip it follows the old way, after the one
+  before it. This is for pictures and videos on the same display and layer; a
+  sound, or a picture on another layer, still fades out by itself. In a *Start
+  all together* group, the cues that start with it share the display without
+  replacing each other; one with a pre-wait comes in later by itself and replaces
+  what is on its layer, as any cue does.
+- **Selecting and dragging cues:** Ctrl-click (Cmd on a Mac) adds a cue to the
+  selection or takes it out, and Shift-click takes every row from the selected one
+  to the one clicked. Delete, Duplicate, Ctrl+↑/↓ and arm/disarm then work on all
+  of them (a group counts with its children). Drag a cue, or the whole selection by
+  any one of it, to move it: a line shows where it will land, before or after a row,
+  and dropping on the middle of a group puts it inside at the end (a child dropped
+  by another child joins that group; a group can't go into one). The list scrolls
+  when you drag near its top or bottom. Rows can't be dragged in show mode or while
+  the Find box is filtering the list. Right-click one of the selected cues (the
+  selection stays) and choose *Group the N selected cues* to wrap them in one new
+  group where the first one is, or *Move N cues into group* to put them in a group
+  that exists. A group among them is left out, and one that was inside another
+  group comes out of it.
+- **Shapes:** *Cue ▸ Add Shape cue* draws a solid **square, rectangle, circle,
+  oval or star** in the middle of a display, in a colour you pick (the colour's
+  opacity makes it see-through). A square, circle or star has one size and a
+  rectangle or oval a width and a height, all as a share of the display's
+  height; a star has 3 to 12 points. It plays like an image cue, with the same
+  output, layer, transition, fades, hold time and geometry (move and scale it
+  there), and the edges are smooth.
+- **Editing several cues at once:** pick cues (Ctrl-click or Shift-click) and
+  change a setting in the inspector: it is changed in all of them, whatever it
+  is (duration, pre-wait, fades, layer, transition, volume, effects, arm…). A
+  setting a cue does not have is skipped there, so a fade time reaches the
+  videos and pictures and passes a wait by. Names, numbers, notes, hotkeys, files
+  and text are each cue's own and never copied. A cue's position, colour
+  correction or motion that is not set is the default: changing one number of it
+  changes only that number in the others, not their own settings. A list (effects,
+  audio routing) changes item by item, and only where the others have the same
+  item. The playback settings reach text, shape and camera cues as well as videos,
+  pictures and sounds.
 - **Text cues:** titles, surtitles and lower-thirds. Type the text (several
   lines are fine), then set its size (a share of the output's height), colour,
   alignment, where it sits (top, middle or bottom) and where it wraps. It's
@@ -817,8 +954,34 @@ enter, and *Test Mode* downloads its free test media when you start it.
   doesn't start it, and firing it by hand (or over OSC) does nothing. A
   disarmed group takes its children with it. Disarmed rows are greyed out,
   and the *Standing by* display shows the cue GO will really fire.
-- **Layers and fit modes:** fit (letterbox), fill (crop) and stretch; higher
-  layers draw on top; per-cue opacity and volume can be adjusted live.
+- **Layers and fit modes:** fit (letterbox), fill (crop) and stretch; per-cue
+  opacity and volume can be adjusted live. Each picture cue (video, image, text,
+  camera) has a **Layer** number in the inspector, from -1000 to 1000: layer 1 is
+  drawn on top of layer 0, 2 on top of 0 and 1, and a negative layer goes under
+  0. The cue list shows a layer other than 0 after the display's name. A cue
+  that comes in with a cut or a crossfade replaces only what is on its own layer
+  of that display; cues on the other layers keep playing (a dip to black or white
+  still covers, and clears, the whole display). On the same layer the newest is on
+  top. (A show made before layers did this, with cues on layers other than 0,
+  now keeps them on screen when a cue on layer 0 cuts or crossfades in; before, it
+  cleared them.)
+- **Changes apply while a cue plays:** edit a cue in the inspector while it is
+  on screen and it follows, with nothing to stop and fire again: layer, position,
+  scale, rotation and crop, colour correction, effects, opacity, volume, fit, the
+  display it is on, how long a picture, text, shape or camera is held, and a
+  shape's or text's own settings (shape, size, colour, points, the words, the
+  size of the letters), which are drawn again. Things that are fixed when a cue
+  starts, such as the file, the in and out points, looping, speed, the audio
+  routing and a transition's fade-in time, take effect the next time it is fired.
+- **Copy and paste:** Ctrl+C, Ctrl+X and Ctrl+V (or *Edit*, or right-click) copy,
+  cut and paste the selected cues, a group with its children. A paste goes after
+  the selected cue, or at the end of a selected group, and the pasted cues are
+  selected. They get new ids and numbers; a hotkey or MIDI note is left off, as
+  with Duplicate. A fade, stop or control cue copied with the cue it aims at aims
+  at the copy; copied without it, it keeps its aim in the same show and loses it
+  in another. Cut and paste puts the cues back with their old ids (once), so what
+  aimed at them still does. The copies stay for the whole session, so open another show
+  and paste there (a display the other show doesn't have becomes its first one).
 - **Instant GO:** the next cue(s) are decoded ahead of time (a green dot in the
   cue list means a cue is preloaded).
 - **Audio/video sync:** video with sound is slaved to the audio clock.
@@ -1078,7 +1241,9 @@ night is about 3,000 rows.
 | ← / Page Up           | Show mode: the slide before in such a slide show; otherwise pause everything, and again to fade it out |
 | Ctrl+↑ / Ctrl+↓       | Reorder the selected cue                        |
 | ← ↑ → ↓ / Shift+arrow | Move the selected corner 1 px / 5 px (while editing) |
-| Ctrl+D / Del          | Duplicate / delete cue                          |
+| Ctrl+D / Del          | Duplicate / delete cue (all selected)           |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste cues                    |
+| Ctrl-click / Shift-click | Add to the selection / select a run of cues  |
 | Ctrl+Z / Ctrl+Y       | Undo / redo (Ctrl+Shift+Z also redoes)          |
 | Ctrl+N / Ctrl+O / Ctrl+S | New / open / save show                       |
 | Ctrl+Shift+S          | Save as                                         |

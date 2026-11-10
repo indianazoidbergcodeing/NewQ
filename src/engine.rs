@@ -182,8 +182,48 @@ pub struct ImageState {
     pub transform: LayerTransform,
     pub color: ColorAdjust,
     pub fx: VideoFx,
+    /// Set for a shape or typed text: the picture is drawn again when its settings change.
+    redraw: Option<Redraw>,
     /// Set for a clock or timer: the picture is redrawn as the time changes.
     live: Option<LiveText>,
+}
+
+/// A shape or text picture kept in step with its cue while it is on screen.
+struct Redraw {
+    /// What the picture on screen (or on its way) was drawn from.
+    key: String,
+    /// A newer picture being drawn.
+    pending: Option<Receiver<Result<RgbaImage, String>>>,
+}
+
+/// What a shape or typed text cue's picture is drawn from, with the size of
+/// its display: when this changes the picture has to be drawn again.
+fn drawing_key(kind: &CueKind, size: (u32, u32)) -> Option<String> {
+    match kind {
+        CueKind::Shape(s) => Some(format!(
+            "{:?}",
+            (s.shape, s.color, s.width, s.height, s.points, size)
+        )),
+        CueKind::Text(t) if !t.source.is_live() => Some(format!(
+            "{:?}",
+            (
+                &t.text, t.size, t.color, t.align, t.valign, t.width, t.shadow, t.bold, size
+            )
+        )),
+        _ => None,
+    }
+}
+
+/// Draw the picture of a shape or typed text cue on a thread.
+fn draw_cue_on_thread(
+    kind: &CueKind,
+    size: (u32, u32),
+) -> Option<Receiver<Result<RgbaImage, String>>> {
+    match kind {
+        CueKind::Shape(s) => Some(draw_shape_on_thread(s.clone(), size)),
+        CueKind::Text(t) => Some(draw_text_on_thread(t.clone(), size)),
+        _ => None,
+    }
 }
 
 /// A clock or timer text cue being kept up to date.
@@ -313,6 +353,9 @@ pub struct ActiveCue {
     followed: bool,
     panic: bool,
     entry: Option<EntryAction>,
+    /// The instance of the group (all together) whose child this is: its brothers
+    /// are not replaced or faded by its entry, since they were meant to play with it.
+    together: Option<u64>,
 }
 
 /// Decoders for a new position in a cue that is playing. The old ones keep
@@ -402,6 +445,15 @@ impl ActiveCue {
     fn is_visual(&self) -> bool {
         matches!(self.kind, ActiveKind::Video(_) | ActiveKind::Image(_))
     }
+    /// The layer a picture is on (higher is on top); a dip's matte covers all.
+    fn layer_no(&self) -> Option<i32> {
+        match &self.kind {
+            ActiveKind::Video(v) => Some(v.layer),
+            ActiveKind::Image(i) => Some(i.layer),
+            ActiveKind::Matte(_) => Some(i32::MAX),
+            _ => None,
+        }
+    }
     /// Anything drawn on an output, including dip mattes.
     fn is_layer(&self) -> bool {
         self.is_visual() || matches!(self.kind, ActiveKind::Matte(_))
@@ -452,6 +504,33 @@ pub struct Reading {
 /// How long a cue whose preparation failed is left alone before another try.
 const PREP_RETRY: Duration = Duration::from_secs(5);
 const PROBE_LIMIT: Duration = Duration::from_secs(30);
+
+/// When `cue` is a child of a "play in order" group and the child after it
+/// crossfades in, how long that crossfade takes: the next child starts that
+/// long before this one ends and the two fade across, instead of this one
+/// fading out to black first (a slide show times its own slides).
+fn crossfade_into_next(show: &Show, cue: &Cue) -> Option<(CueId, f64)> {
+    let group = show.cue(cue.parent?)?;
+    match &group.kind {
+        CueKind::Group(g) if g.mode == GroupMode::Playlist && g.slides.is_none() => {}
+        _ => return None,
+    }
+    let kids = show.armed_children(group.id);
+    let at = kids.iter().position(|c| c.id == cue.id)?;
+    let next = kids.get(at + 1)?;
+    let m = next.kind.media()?;
+    // Only a picture is faded by the next picture's crossfade, and only one on the
+    // same display and layer: anything else has to fade itself out.
+    let here = cue.kind.media()?;
+    let picture = |k: &CueKind| !matches!(k.cue_type(), CueType::Audio | CueType::LiveAudio);
+    (picture(&cue.kind)
+        && picture(&next.kind)
+        && here.output == m.output
+        && here.layer == m.layer
+        && m.transition == Transition::Crossfade
+        && m.fade_in > 0.0)
+        .then_some((next.id, m.fade_in))
+}
 
 /// How many of the cues wanted are children of a group.
 fn group_children_wanted(wanted: &[CueId], show: &Show) -> usize {
@@ -569,6 +648,8 @@ pub struct Engine {
     /// settings for a few seconds, so a bad file isn't retried every tick.
     failed_preps: HashMap<CueId, (PrepSig, Instant)>,
     next_instance: u64,
+    /// The group (and its instance) whose children are being started together right now.
+    group_start: Option<(CueId, u64)>,
     /// Cameras found on this machine (the test picture first), and a scan under way.
     cameras: Vec<String>,
     camera_scan: Option<Receiver<Vec<String>>>,
@@ -627,6 +708,7 @@ impl Engine {
             prepared: Vec::new(),
             failed_preps: HashMap::new(),
             next_instance: 1,
+            group_start: None,
             cameras: vec![TEST_PATTERN_DEVICE.to_string()],
             camera_scan: None,
             scanned: false,
@@ -666,6 +748,7 @@ impl Engine {
             prepared: Vec::new(),
             failed_preps: HashMap::new(),
             next_instance: 1,
+            group_start: None,
             cameras: vec![TEST_PATTERN_DEVICE.to_string()],
             camera_scan: None,
             scanned: false,
@@ -863,6 +946,7 @@ impl Engine {
             }
             CueKind::Image(m) => Some(m.end.filter(|d| *d > 0.0)),
             CueKind::Text(t) => Some(t.media.end.filter(|d| *d > 0.0)),
+            CueKind::Shape(s) => Some(s.media.end.filter(|d| *d > 0.0)),
             CueKind::Camera(c) => Some(c.media.end.filter(|d| *d > 0.0)),
             CueKind::LiveAudio(c) => Some(c.media.end.filter(|d| *d > 0.0)),
             CueKind::Fade(f) => Some(Some(f.duration)),
@@ -1788,6 +1872,24 @@ impl Engine {
         }
     }
 
+    /// Draw a shape cue at its output's size, on a thread.
+    fn prepare_shape(&self, cue: &Cue, s: &ShapeCue) -> Prepared {
+        let size = self.output_size(s.media.output);
+        Prepared {
+            pass_len: None,
+            speed: None,
+            cue_id: cue.id,
+            sig: PrepSig {
+                media: s.media.clone(),
+                size,
+                camera: None,
+            },
+            kind: PreparedKind::Text(draw_shape_on_thread(s.clone(), size)),
+            duration: s.media.end.filter(|d| *d > 0.0),
+            warning: None,
+        }
+    }
+
     fn take_prepared(&mut self, cue: &Cue) -> Option<Prepared> {
         let sig = self.signature(cue)?;
         let idx = self
@@ -1795,6 +1897,31 @@ impl Engine {
             .iter()
             .position(|p| p.cue_id == cue.id && p.sig == sig)?;
         Some(self.prepared.remove(idx))
+    }
+
+    /// The instance of the group, started to play all its children together, that
+    /// `cue` is a child of (those children share a display without replacing each other).
+    fn together_with(&self, show: &Show, cue: &Cue) -> Option<u64> {
+        let group = cue.parent?;
+        if let Some((g, instance)) = self.group_start
+            && g == group
+        {
+            return Some(instance);
+        }
+        let timeline = show
+            .cue(group)
+            .is_some_and(|c| matches!(&c.kind, CueKind::Group(g) if g.mode == GroupMode::Timeline && g.slides.is_none()));
+        // The newest run of the group (it may be fired again while the last still plays).
+        self.active
+            .iter()
+            .filter(|a| {
+                a.cue_id == group
+                    && !a.stopping
+                    && matches!(&a.kind, ActiveKind::Group(g) if !g.deck)
+            })
+            .filter(|_| timeline)
+            .map(|a| a.instance)
+            .max()
     }
 
     fn alloc_instance(&mut self) -> u64 {
@@ -1870,6 +1997,7 @@ impl Engine {
             followed: true,
             panic: false,
             entry: None,
+            together: None,
         });
         if cue.continue_mode == ContinueMode::AutoContinue {
             self.fire_next(show, cue.id);
@@ -1885,6 +2013,7 @@ impl Engine {
         let dips = match &cue.kind {
             CueKind::Video(m) | CueKind::Image(m) => Some(m),
             CueKind::Text(t) => Some(&t.media),
+            CueKind::Shape(s) => Some(&s.media),
             CueKind::Camera(c) => Some(&c.media),
             _ => None,
         };
@@ -1923,13 +2052,21 @@ impl Engine {
             followed: false,
             panic: false,
             entry: None,
+            together: None,
         };
         let mut ok = true;
+        // A child with a pre-wait comes in by itself, later, and replaces what was there.
+        active.together = if cue.pre_wait > 0.0 {
+            None
+        } else {
+            self.together_with(show, &cue)
+        };
         match &cue.kind {
             CueKind::Video(_)
             | CueKind::Image(_)
             | CueKind::Audio(_)
             | CueKind::Text(_)
+            | CueKind::Shape(_)
             | CueKind::Camera(_)
             | CueKind::LiveAudio(_) => {
                 let m = cue.kind.media().expect("these cues have playback settings");
@@ -1937,6 +2074,7 @@ impl Engine {
                     Some(p) => Ok(p),
                     None => match (&cue.kind, &self.ff) {
                         (CueKind::Text(t), _) => Ok(self.prepare_text(&cue, t)),
+                        (CueKind::Shape(s), _) => Ok(self.prepare_shape(&cue, s)),
                         (CueKind::LiveAudio(c), _) => self.prepare_live_audio(&cue, c),
                         (_, None) => Err("ffmpeg not found".to_string()),
                         (CueKind::Camera(c), Some(_)) => self.prepare_camera(&cue, c),
@@ -2004,6 +2142,7 @@ impl Engine {
                                 transform: m.transform,
                                 color: m.color,
                                 fx: VideoFx::at(&m.effects, 0.0),
+                                redraw: None,
                                 live: None,
                             }),
                             PreparedKind::Audio(voice) => ActiveKind::Audio(voice),
@@ -2018,6 +2157,8 @@ impl Engine {
                                 transform: m.transform,
                                 color: m.color,
                                 fx: VideoFx::at(&m.effects, 0.0),
+                                redraw: drawing_key(&cue.kind, self.output_size(m.output))
+                                    .map(|key| Redraw { key, pending: None }),
                                 live: match &cue.kind {
                                     CueKind::Text(t) if t.source.is_live() => {
                                         crate::live_text::resolve(
@@ -2196,9 +2337,13 @@ impl Engine {
                         GroupMode::Timeline => children.len(),
                         GroupMode::Playlist => 1,
                     };
+                    self.group_start =
+                        (g.mode == GroupMode::Timeline && !deck && g.slides.is_none())
+                            .then_some((id, instance));
                     for &child in &children[..first] {
                         self.fire(show, child);
                     }
+                    self.group_start = None;
                     active.kind = ActiveKind::Group(GroupState {
                         mode: g.mode,
                         children,
@@ -2235,16 +2380,32 @@ impl Engine {
 
     /// Run a cue's entry action once its first frame is on screen.
     fn apply_entry(&mut self, instance: u64, output: Option<OutputId>, e: EntryAction) {
+        // Cues started together by one group don't replace each other.
+        let together = self
+            .active
+            .iter()
+            .find(|a| a.instance == instance)
+            .and_then(|a| a.together);
+        let brother = |o: &ActiveCue| together.is_some() && o.together == together;
+        // A picture replaces only what is on its own layer of the display (and a
+        // dip's matte, which covers every layer): the other layers stay.
+        let layer = self
+            .active
+            .iter()
+            .find(|a| a.instance == instance)
+            .and_then(|a| a.layer_no());
+        let replaced = |o: &ActiveCue| {
+            o.is_layer() && o.output() == output && (o.is_matte() || o.layer_no() == layer)
+        };
         match e {
             EntryAction::Cut => self
                 .active
-                .retain(|o| o.instance == instance || !(o.is_layer() && o.output() == output)),
+                .retain(|o| o.instance == instance || brother(o) || !replaced(o)),
             EntryAction::Crossfade { time, curve } => {
                 for o in &mut self.active {
                     // What was there before it: a slide started after this one (a
                     // quick second GO) is not for this one to fade away.
-                    if o.instance < instance && o.is_layer() && o.output() == output && !o.stopping
-                    {
+                    if o.instance < instance && replaced(o) && !o.stopping && !brother(o) {
                         o.fade_out_and_stop(time, curve);
                     }
                 }
@@ -2258,6 +2419,7 @@ impl Engine {
                 self.active.retain(|o| {
                     o.instance == instance
                         || o.instance == matte
+                        || brother(o)
                         || !(o.is_layer() && o.output() == out)
                 });
                 if let Some(m) = self.active.iter_mut().find(|a| a.instance == matte) {
@@ -2276,6 +2438,21 @@ impl Engine {
         self.timecode.tick(dt);
         for problem in self.outbox.errors() {
             self.log(problem);
+        }
+        // A layer changed in the inspector moves a cue that is already on screen.
+        for a in &mut self.active {
+            if matches!(a.kind, ActiveKind::Video(_) | ActiveKind::Image(_))
+                && let Some(layer) = show
+                    .cue(a.cue_id)
+                    .and_then(|c| c.kind.media())
+                    .map(|m| m.layer)
+            {
+                match &mut a.kind {
+                    ActiveKind::Video(v) => v.layer = layer,
+                    ActiveKind::Image(i) => i.layer = layer,
+                    _ => {}
+                }
+            }
         }
 
         if !self.paused {
@@ -2319,6 +2496,13 @@ impl Engine {
         }
 
         let paused = self.paused;
+        let sizes = self.output_sizes.clone();
+        let running: std::collections::HashSet<CueId> = self
+            .pending
+            .iter()
+            .map(|p| p.cue_id)
+            .chain(self.active.iter().map(|a| a.cue_id))
+            .collect();
         let done_groups = if paused {
             Vec::new()
         } else {
@@ -2439,6 +2623,32 @@ impl Engine {
                     if a.started && !paused {
                         a.elapsed += dt;
                     }
+                    // A shape or typed text whose settings were changed is drawn again.
+                    if img.loader.is_none()
+                        && let (Some(rd), Some(c), Some(m)) = (&mut img.redraw, cue, media)
+                    {
+                        if let Some(rx) = &rd.pending
+                            && let Ok(result) = rx.try_recv()
+                        {
+                            rd.pending = None;
+                            if let Ok(i) = result {
+                                img.image = Some(i);
+                                img.version += 1;
+                            }
+                        }
+                        if rd.pending.is_none() {
+                            let size = m
+                                .output
+                                .and_then(|o| sizes.get(&o).copied())
+                                .unwrap_or(DEFAULT_OUTPUT_SIZE);
+                            if let Some(key) = drawing_key(&c.kind, size)
+                                && key != rd.key
+                            {
+                                rd.key = key;
+                                rd.pending = draw_cue_on_thread(&c.kind, size);
+                            }
+                        }
+                    }
                     if let (Some(live), Some(CueKind::Text(t))) =
                         (&mut img.live, cue.map(|c| &c.kind))
                     {
@@ -2557,6 +2767,12 @@ impl Engine {
                 };
                 match &mut a.kind {
                     ActiveKind::Video(v) => {
+                        v.output = m.output;
+                        v.fit = m.fit;
+                        // A camera runs for the time set, which can be changed while it is up.
+                        if v.player.is_live() && !a.stopping {
+                            a.duration = m.end.filter(|d| *d > 0.0);
+                        }
                         v.transform = geometry;
                         v.color = m.color;
                         v.fx = VideoFx::at(&m.effects, a.elapsed);
@@ -2565,6 +2781,15 @@ impl Engine {
                         }
                     }
                     ActiveKind::Image(i) => {
+                        i.output = m.output;
+                        // Text and shapes are drawn at the display's size, never fitted.
+                        if matches!(cue.map(|c| &c.kind), Some(CueKind::Image(_))) {
+                            i.fit = m.fit;
+                        }
+                        // The time a picture is held, changed while it is up.
+                        if !a.stopping {
+                            a.duration = m.end.filter(|d| *d > 0.0);
+                        }
                         i.transform = geometry;
                         i.color = m.color;
                         i.fx = VideoFx::at(&m.effects, a.elapsed);
@@ -2590,6 +2815,14 @@ impl Engine {
                 // Automatic fade-out before the media ends.
                 if let Some(d) = a.duration
                     && m.fade_out > 0.0
+                    && !cue
+                        .and_then(|c| crossfade_into_next(show, c))
+                        .is_some_and(|(next, t)| {
+                            // The next picture's crossfade fades this one: not before it
+                            // has begun, and not for good if it is very late.
+                            let left = d - a.elapsed;
+                            (left > t || running.contains(&next)) && left > 0.2
+                        })
                     && !a.auto_faded
                     && !a.stopping
                     && a.started
@@ -2666,6 +2899,25 @@ impl Engine {
             let ActiveKind::Group(g) = &a.kind else {
                 continue;
             };
+            // The child before the next one is nearly over and the next crossfades in:
+            // start it now, so the two fade across.
+            if !a.stopping
+                && g.mode == GroupMode::Playlist
+                && let Some(&next) = g.children.get(g.next)
+                && let Some(&current) = g.next.checked_sub(1).and_then(|n| g.children.get(n))
+                && let Some((aimed, t)) =
+                    show.cue(current).and_then(|c| crossfade_into_next(show, c))
+                && aimed == next
+                && self.active.iter().any(|c| {
+                    c.cue_id == current
+                        && !c.stopping
+                        && c.started
+                        && c.duration.is_some_and(|d| d - c.elapsed <= t)
+                })
+            {
+                to_fire.push((a.instance, next));
+                continue;
+            }
             if a.stopping || g.children.iter().any(|c| self.is_running(*c)) {
                 continue;
             }
@@ -2942,6 +3194,21 @@ impl Engine {
         layers.sort_by_key(|(layer, l)| (*layer, l.instance));
         layers.into_iter().map(|(_, l)| l).collect()
     }
+}
+
+fn draw_shape_on_thread(cue: ShapeCue, size: (u32, u32)) -> Receiver<Result<RgbaImage, String>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let sender = tx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("shape-render".into())
+        .spawn(move || {
+            let _ = sender.send(Ok(crate::shape::render(&cue, size)));
+        });
+    if let Err(e) = spawned {
+        // No thread to draw on: the cue reports it rather than hanging.
+        let _ = tx.send(Err(format!("could not start drawing the shape: {e}")));
+    }
+    rx
 }
 
 fn draw_text_on_thread(cue: TextCue, size: (u32, u32)) -> Receiver<Result<RgbaImage, String>> {
@@ -4045,6 +4312,495 @@ mod tests {
         e.go(&show);
         run_for(&mut e, &show, 0.3);
         assert!(e.is_prepared(b), "pre-wait cue must stay preloaded");
+    }
+
+    /// A group of `n` pictures to one display, each with `transition`.
+    fn picture_group(
+        show: &mut Show,
+        img: &Path,
+        mode: GroupMode,
+        transition: Transition,
+        n: usize,
+    ) -> (CueId, Vec<CueId>) {
+        let mut g = show.make_cue(CueType::Group, None, show.cues.len());
+        if let CueKind::Group(gc) = &mut g.kind {
+            gc.mode = mode;
+        }
+        let gid = g.id;
+        show.cues.push(g);
+        let mut kids = Vec::new();
+        for _ in 0..n {
+            let k = image_cue(show, img, transition, 0.2);
+            let i = show.cue_index(k).unwrap();
+            show.cues[i].parent = Some(gid);
+            kids.push(k);
+        }
+        (gid, kids)
+    }
+
+    #[test]
+    fn pictures_a_group_starts_together_stay_on_screen_together_cut_or_crossfaded() {
+        let Some((mut e, img)) = engine_with_image() else {
+            return;
+        };
+        // (A dip to black or white is not covered: each child of the group dips by itself.)
+        for transition in [Transition::Crossfade, Transition::Cut] {
+            let mut show = Show::default();
+            let out = show.outputs[0].id;
+            let (gid, kids) = picture_group(&mut show, &img, GroupMode::Timeline, transition, 3);
+            // Something else on the display first: the group's pictures still replace that.
+            let before = image_cue(&mut show, &img, Transition::Cut, 0.0);
+            e.stop_all(0.0);
+            e.playhead = Some(before);
+            e.go(&show);
+            run_until(&mut e, &show, "the first picture", |e| {
+                stack(e, out).len() == 1
+            });
+            e.fire(&show, gid);
+            run_until(&mut e, &show, "the three pictures", |e| {
+                kids.iter()
+                    .all(|k| stack(e, out).iter().any(|l| l.0 == Some(*k)))
+            });
+            run_for(&mut e, &show, 0.6);
+            let s = stack(&e, out);
+            assert!(
+                kids.iter().all(|k| s.iter().any(|l| l.0 == Some(*k))),
+                "{transition:?}: {s:?}"
+            );
+            assert!(
+                s.iter().all(|l| l.0 != Some(before)),
+                "{transition:?}: the earlier picture is replaced: {s:?}"
+            );
+            assert!(
+                s.iter()
+                    .filter(|l| l.0.is_some_and(|c| kids.contains(&c)))
+                    .all(|l| l.2 > 0.99)
+            );
+        }
+    }
+
+    #[test]
+    fn a_picture_replaces_only_what_is_on_its_own_layer_and_a_higher_layer_is_on_top() {
+        if engine_with_image().is_none() {
+            return;
+        }
+        for transition in [Transition::Cut, Transition::Crossfade] {
+            let (mut e, img) = engine_with_image().unwrap();
+            let mut show = Show::default();
+            let out = show.outputs[0].id;
+            // Layers 5, -2 and 0 (listed in that order), then a second cue on layer 0.
+            let mut ids = Vec::new();
+            for layer in [5, -2, 0, 0] {
+                let c = image_cue(&mut show, &img, transition, 0.1);
+                let i = show.cue_index(c).unwrap();
+                show.cues[i].kind.media_mut().unwrap().layer = layer;
+                ids.push(c);
+            }
+            let on_screen = |e: &Engine| {
+                stack(e, out)
+                    .iter()
+                    .filter(|l| l.2 > 0.99)
+                    .map(|l| l.0.unwrap())
+                    .collect::<Vec<_>>()
+            };
+            for (n, &c) in ids[..3].iter().enumerate() {
+                e.fire(&show, c);
+                run_until(&mut e, &show, "on screen", |e| on_screen(e).len() == n + 1);
+            }
+            run_for(&mut e, &show, 0.4);
+            // Bottom to top: layer -2, 0, 5, whatever order they started in.
+            assert_eq!(
+                on_screen(&e),
+                vec![ids[1], ids[2], ids[0]],
+                "{transition:?}"
+            );
+            // Another cue on layer 0 takes the place of the one there, and only that.
+            e.fire(&show, ids[3]);
+            run_until(&mut e, &show, "replaced", |e| {
+                on_screen(e).contains(&ids[3]) && !on_screen(e).contains(&ids[2])
+            });
+            run_for(&mut e, &show, 0.4);
+            assert_eq!(
+                on_screen(&e),
+                vec![ids[1], ids[3], ids[0]],
+                "{transition:?}: the other layers stay and the order holds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layer_changed_while_a_cue_plays_moves_it_at_once() {
+        let Some((mut e, img)) = engine_with_image() else {
+            return;
+        };
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let a = image_cue(&mut show, &img, Transition::Cut, 0.0);
+        let b = image_cue(&mut show, &img, Transition::Cut, 0.0);
+        for (n, id) in [a, b].into_iter().enumerate() {
+            let i = show.cue_index(id).unwrap();
+            show.cues[i].kind.media_mut().unwrap().layer = n as i32;
+            e.fire(&show, id);
+            run_until(&mut e, &show, "on screen", |e| stack(e, out).len() == n + 1);
+        }
+        let order = |e: &Engine| {
+            stack(e, out)
+                .iter()
+                .map(|l| l.0.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&e), vec![a, b], "b is on layer 1, over a");
+        // Layer -1 for b, in the show only: the playing cue goes under a without a refire.
+        let i = show.cue_index(b).unwrap();
+        show.cues[i].kind.media_mut().unwrap().layer = -1;
+        e.tick(&show, 0.02);
+        assert_eq!(order(&e), vec![b, a]);
+        let i = show.cue_index(b).unwrap();
+        show.cues[i].kind.media_mut().unwrap().layer = 7;
+        e.tick(&show, 0.02);
+        assert_eq!(order(&e), vec![a, b]);
+    }
+
+    #[test]
+    fn the_items_of_a_group_crossfade_into_each_other_and_do_not_dip_to_black() {
+        let Some((ff, clip)) = crate::media::test_media("smpte_8s.mp4") else {
+            return;
+        };
+        let mut e = engine_without_media();
+        e.ff = Some(ff);
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let mut g = show.make_cue(CueType::Group, None, 0);
+        if let CueKind::Group(gc) = &mut g.kind {
+            gc.mode = GroupMode::Playlist;
+        }
+        let gid = g.id;
+        show.cues.push(g);
+        let mut kids = Vec::new();
+        for _ in 0..2 {
+            let mut c = show.make_cue(CueType::Video, Some(clip.clone()), show.cues.len());
+            c.parent = Some(gid);
+            let m = c.kind.media_mut().unwrap();
+            m.end = Some(2.5);
+            m.transition = Transition::Crossfade;
+            m.fade_in = 1.0;
+            m.fade_out = 1.0;
+            kids.push(c.id);
+            show.cues.push(c);
+        }
+        e.fire(&show, gid);
+        // Watch the picture until the second one has finished: the opacities
+        // of what is on screen add up to about 1 once the first is in.
+        let mut worst = f32::MAX;
+        let mut both = false;
+        let mut seen_second = false;
+        let mut armed = false;
+        let t0 = Instant::now();
+        let mut last = Instant::now();
+        while t0.elapsed().as_secs_f64() < 9.0 {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = Instant::now();
+            e.tick(&show, now.duration_since(last).as_secs_f64());
+            last = now;
+            let s = stack(&e, out);
+            let total: f32 = s.iter().map(|l| l.2).sum();
+            let on = |k: CueId| s.iter().any(|l| l.0 == Some(k));
+            both |= on(kids[0]) && on(kids[1]);
+            seen_second |= on(kids[1]);
+            // From when the first is fully up until it has gone: nothing dips.
+            armed |= total >= 0.99;
+            if armed && on(kids[0]) {
+                worst = worst.min(total);
+            }
+            if seen_second && !on(kids[1]) && !on(kids[0]) {
+                break;
+            }
+        }
+        assert!(both, "the two are on screen together while they cross");
+        // (A slow start of the second clip on a busy computer can make a short dip.)
+        assert!(worst > 0.7, "the picture dipped: {worst}");
+    }
+
+    #[test]
+    fn a_shape_cue_is_drawn_at_the_displays_size_in_its_colour_and_layer() {
+        let mut e = engine_without_media();
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let mut cues = Vec::new();
+        for (shape, layer, color) in [
+            (ShapeKind::Circle, 0, [10, 200, 30, 255]),
+            (ShapeKind::Square, 3, [250, 0, 0, 255]),
+        ] {
+            let mut c = show.make_cue(CueType::Shape, None, show.cues.len());
+            if let CueKind::Shape(s) = &mut c.kind {
+                s.shape = shape;
+                s.color = color;
+                s.media.layer = layer;
+                s.media.transition = Transition::Cut;
+                s.media.output = Some(out);
+            }
+            cues.push(c.id);
+            show.cues.push(c);
+        }
+        let size = e.output_size(Some(out));
+        for (n, id) in cues.iter().enumerate() {
+            e.fire(&show, *id);
+            run_until(&mut e, &show, "the shape", |e| {
+                e.layers(out)
+                    .iter()
+                    .filter(|l| matches!(l.source, LayerSource::Image(..)))
+                    .count()
+                    == n + 1
+            });
+        }
+        run_for(&mut e, &show, 0.2);
+        let layers = e.layers(out);
+        assert_eq!(layers.len(), 2, "a cut on another layer leaves the first");
+        let colours: Vec<[u8; 4]> = layers
+            .iter()
+            .map(|l| match l.source {
+                LayerSource::Image(img, _) => {
+                    assert_eq!((img.width, img.height), (size.0.max(2), size.1.max(2)));
+                    let i = (((img.height / 2) * img.width + img.width / 2) * 4) as usize;
+                    [
+                        img.data[i],
+                        img.data[i + 1],
+                        img.data[i + 2],
+                        img.data[i + 3],
+                    ]
+                }
+                _ => panic!("a picture"),
+            })
+            .collect();
+        // Bottom to top: the circle on layer 0, then the square on layer 3.
+        assert_eq!(colours, vec![[10, 200, 30, 255], [250, 0, 0, 255]]);
+    }
+
+    #[test]
+    fn a_shape_or_text_that_is_playing_follows_every_change_made_to_its_cue() {
+        let mut e = engine_without_media();
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let mut shape = show.make_cue(CueType::Shape, None, 0);
+        if let CueKind::Shape(s) = &mut shape.kind {
+            s.media.transition = Transition::Cut;
+            s.media.output = Some(out);
+            s.color = [255, 0, 0, 255];
+        }
+        let sid = shape.id;
+        show.cues.push(shape);
+        let mut text = show.make_cue(CueType::Text, None, 0);
+        if let CueKind::Text(t) = &mut text.kind {
+            t.media.transition = Transition::Cut;
+            t.media.output = Some(out);
+            t.media.layer = 1;
+            t.text = "Hello".into();
+        }
+        let tid = text.id;
+        show.cues.push(text);
+        for id in [sid, tid] {
+            e.fire(&show, id);
+        }
+        run_until(&mut e, &show, "both up", |e| e.layers(out).len() == 2);
+        // What each picture holds: the pixels with something in them, and the
+        // colour in the middle.
+        let ink = |e: &Engine, layer: usize| -> (usize, [u8; 4], u64, Fit, XformScale) {
+            let l = &e.layers(out)[layer];
+            let LayerSource::Image(img, version) = l.source else {
+                panic!("a picture");
+            };
+            let i = (((img.height / 2) * img.width + img.width / 2) * 4) as usize;
+            (
+                img.data.chunks(4).filter(|p| p[3] > 127).count(),
+                [
+                    img.data[i],
+                    img.data[i + 1],
+                    img.data[i + 2],
+                    img.data[i + 3],
+                ],
+                version,
+                l.fit,
+                l.transform.scale_x,
+            )
+        };
+        type XformScale = f32;
+        // Wait for a change to reach the picture.
+        fn settle(e: &mut Engine, show: &Show, out: OutputId, layer: usize, from: u64) {
+            run_until(
+                e,
+                show,
+                "a new picture",
+                |e| matches!(e.layers(out)[layer].source, LayerSource::Image(_, v) if v > from),
+            );
+        }
+        let (area0, colour0, v0, _, scale0) = ink(&e, 0);
+        assert_eq!(colour0, [255, 0, 0, 255]);
+        assert_eq!(scale0, 1.0);
+        // The scale and position of the geometry follow at once.
+        let i = show.cue_index(sid).unwrap();
+        show.cues[i].kind.media_mut().unwrap().transform.scale_x = 2.0;
+        e.tick(&show, 0.02);
+        assert_eq!(ink(&e, 0).4, 2.0);
+        // The size, the colour and the shape are drawn again.
+        if let CueKind::Shape(s) = &mut show.cues[i].kind {
+            s.height = 0.8;
+            s.color = [0, 0, 255, 255];
+        }
+        settle(&mut e, &show, out, 0, v0);
+        let (area1, colour1, v1, _, _) = ink(&e, 0);
+        assert!(area1 > area0 * 3, "{area1} is not much bigger than {area0}");
+        assert_eq!(colour1, [0, 0, 255, 255]);
+        if let CueKind::Shape(s) = &mut show.cues[i].kind {
+            s.shape = ShapeKind::Circle;
+        }
+        settle(&mut e, &show, out, 0, v1);
+        let (area2, _, v2, _, _) = ink(&e, 0);
+        assert!(
+            area2 < area1,
+            "a circle is less than its square: {area2} {area1}"
+        );
+        // Nothing is drawn again when nothing it is drawn from changed.
+        show.cues[i].kind.media_mut().unwrap().opacity = 0.5;
+        run_for(&mut e, &show, 0.3);
+        assert_eq!(ink(&e, 0).2, v2);
+        // The words and the size of typed text.
+        let (areat, _, vt, _, _) = ink(&e, 1);
+        let ti = show.cue_index(tid).unwrap();
+        if let CueKind::Text(t) = &mut show.cues[ti].kind {
+            t.size = 0.2;
+        }
+        settle(&mut e, &show, out, 1, vt);
+        let (areat2, _, vt2, _, _) = ink(&e, 1);
+        assert!(areat2 > areat * 2, "bigger letters: {areat2} vs {areat}");
+        if let CueKind::Text(t) = &mut show.cues[ti].kind {
+            t.text = "Hello there, all of you".into();
+        }
+        settle(&mut e, &show, out, 1, vt2);
+        assert!(ink(&e, 1).0 > areat2);
+        // The layer, as before.
+        show.cues[ti].kind.media_mut().unwrap().layer = -4;
+        e.tick(&show, 0.02);
+        assert!(matches!(e.layers(out)[0].source, LayerSource::Image(..)));
+        let order: Vec<CueId> = stack(&e, out).iter().map(|l| l.0.unwrap()).collect();
+        assert_eq!(order, vec![tid, sid]);
+    }
+
+    #[test]
+    fn a_picture_follows_its_fit_and_hold_time_and_display_while_it_plays() {
+        let Some((mut e, img)) = engine_with_image() else {
+            return;
+        };
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let second = show.add_display();
+        let c = image_cue(&mut show, &img, Transition::Cut, 0.0);
+        e.fire(&show, c);
+        run_until(&mut e, &show, "on screen", |e| e.layers(out).len() == 1);
+        let i = show.cue_index(c).unwrap();
+        let fit_before = e.layers(out)[0].fit;
+        let other_fit = if fit_before == Fit::Cover {
+            Fit::Stretch
+        } else {
+            Fit::Cover
+        };
+        show.cues[i].kind.media_mut().unwrap().fit = other_fit;
+        e.tick(&show, 0.02);
+        assert_eq!(e.layers(out)[0].fit, other_fit);
+        // Moved to another display.
+        show.cues[i].kind.media_mut().unwrap().output = Some(second);
+        e.tick(&show, 0.02);
+        assert!(e.layers(out).is_empty());
+        assert_eq!(e.layers(second).len(), 1);
+        // A hold time set while it is up ends it.
+        show.cues[i].kind.media_mut().unwrap().end = Some(0.3);
+        run_until(&mut e, &show, "it to end", |e| e.layers(second).is_empty());
+    }
+
+    #[test]
+    fn a_cue_skips_its_own_fade_out_only_for_a_crossfade_that_will_fade_it() {
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let other = show.add_display();
+        let mut g = show.make_cue(CueType::Group, None, 0);
+        if let CueKind::Group(gc) = &mut g.kind {
+            gc.mode = GroupMode::Playlist;
+        }
+        let gid = g.id;
+        show.cues.push(g);
+        let add = |show: &mut Show, ty: CueType, output: OutputId, layer: i32, fade: f64| {
+            let mut c = show.make_cue(ty, None, show.cues.len());
+            c.parent = Some(gid);
+            let m = c.kind.media_mut().unwrap();
+            m.output = Some(output);
+            m.layer = layer;
+            m.transition = Transition::Crossfade;
+            m.fade_in = fade;
+            let id = c.id;
+            show.cues.push(c);
+            id
+        };
+        let video = add(&mut show, CueType::Video, out, 0, 1.0);
+        let next = add(&mut show, CueType::Video, out, 0, 1.0);
+        let at = |show: &Show, id: CueId| crossfade_into_next(show, show.cue(id).unwrap());
+        assert_eq!(
+            at(&show, video),
+            Some((next, 1.0)),
+            "the same display and layer"
+        );
+        // Another layer or display: the next crossfade does not touch it.
+        let i = show.cue_index(next).unwrap();
+        show.cues[i].kind.media_mut().unwrap().layer = 2;
+        assert_eq!(at(&show, video), None);
+        show.cues[i].kind.media_mut().unwrap().layer = 0;
+        show.cues[i].kind.media_mut().unwrap().output = Some(other);
+        assert_eq!(at(&show, video), None);
+        show.cues[i].kind.media_mut().unwrap().output = Some(out);
+        // A sound is not faded by a picture's crossfade, and no fade-in time, no crossfade.
+        let mut s2 = show.clone();
+        let sound = add(&mut s2, CueType::Audio, out, 0, 0.0);
+        let after = add(&mut s2, CueType::Video, out, 0, 1.0);
+        assert_eq!(at(&s2, sound), None);
+        let _ = after;
+        show.cues[i].kind.media_mut().unwrap().fade_in = 0.0;
+        assert_eq!(at(&show, video), None);
+        show.cues[i].kind.media_mut().unwrap().fade_in = 1.0;
+        show.cues[i].kind.media_mut().unwrap().transition = Transition::Cut;
+        assert_eq!(at(&show, video), None);
+        // The last child has nothing after it.
+        assert_eq!(at(&show, next), None);
+    }
+
+    #[test]
+    fn a_group_fired_again_replaces_its_own_earlier_run_and_a_child_with_a_pre_wait_replaces() {
+        let Some((mut e, img)) = engine_with_image() else {
+            return;
+        };
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let (gid, kids) = picture_group(&mut show, &img, GroupMode::Timeline, Transition::Cut, 2);
+        e.fire(&show, gid);
+        run_until(&mut e, &show, "both", |e| stack(e, out).len() == 2);
+        // Fired again while the first run is up: the new pictures take their place.
+        e.fire(&show, gid);
+        run_until(&mut e, &show, "the run replaced", |e| {
+            let s = stack(e, out);
+            s.len() == 2 && e.active.iter().filter(|a| kids.contains(&a.cue_id)).count() == 2
+        });
+        run_for(&mut e, &show, 0.4);
+        assert_eq!(stack(&e, out).len(), 2, "not four");
+        // A child that waits its own time comes in on its own and replaces the others.
+        e.stop_all(0.0);
+        let mut show = Show::default();
+        let out = show.outputs[0].id;
+        let (gid, kids) = picture_group(&mut show, &img, GroupMode::Timeline, Transition::Cut, 2);
+        let late = show.cue_index(kids[1]).unwrap();
+        show.cues[late].pre_wait = 0.4;
+        e.fire(&show, gid);
+        run_until(&mut e, &show, "the first", |e| stack(e, out).len() == 1);
+        run_until(&mut e, &show, "the second takes over", |e| {
+            let s = stack(e, out);
+            s.len() == 1 && s[0].0 == Some(kids[1])
+        });
     }
 
     #[test]
