@@ -10,7 +10,7 @@
 use crate::media::ffmpeg::Ffmpeg;
 use crate::show::{ServerProtocol, StreamKind};
 use std::io::Write;
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -174,6 +174,9 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         // later, or whose connection drops, never gets a picture. `webcam` is still low
         // latency and keeps the keyframe every two seconds.
         "h264_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
+        "h264_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
+        "h264_d3d12va" => add(&D3D12_ARGS),
+        "h264_vaapi" => add(&VAAPI_ARGS),
         "libopenh264" => add(&["-allow_skip_frames", "0", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
@@ -186,14 +189,56 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
     a
 }
 
+/// What a Direct3D 12 video encoder needs: a device to share with the filter that
+/// puts the picture on the graphics card. Works with any card that has the driver.
+const D3D12_ARGS: [&str; 6] = [
+    "-init_hw_device",
+    "d3d12va=d3",
+    "-filter_hw_device",
+    "d3",
+    "-vf",
+    "format=nv12,hwupload",
+];
+
+/// Kvazaar only takes a picture whose width and height are multiples of 8 (854x480 and
+/// 1366x768 are not), so it is trimmed by up to 7 pixels at the right and bottom.
+const KVAZAAR_FILTER: &str = "crop=trunc(iw/8)*8:trunc(ih/8)*8";
+
+/// Add `filter` to the video filters in `args` (`-vf`): after the ones already there, or as the only one.
+fn add_filter(args: &mut Vec<String>, filter: &str) {
+    match args.iter().position(|a| a == "-vf") {
+        Some(at) if at + 1 < args.len() => {
+            let joined = format!("{},{filter}", args[at + 1]);
+            args[at + 1] = joined;
+        }
+        _ => args.extend(["-vf".to_string(), filter.to_string()]),
+    }
+}
+
+/// The same for VAAPI (Linux: Intel and AMD).
+const VAAPI_ARGS: [&str; 4] = [
+    "-vaapi_device",
+    "/dev/dri/renderD128",
+    "-vf",
+    "format=nv12,hwupload",
+];
+
 /// H.265 encoders to try, best first, as for `H264_ENCODERS`.
-const HEVC_ENCODERS: [&str; 5] = [
+const HEVC_ENCODERS: [&str; 6] = [
     "libx265",
     "hevc_videotoolbox",
     "hevc_nvenc",
     "hevc_qsv",
     "hevc_amf",
+    // Free and in an LGPL build (NewQ's Windows and Linux ones have no libx265).
+    "libkvazaar",
 ];
+
+/// AV1 encoders to try, best first: the graphics hardware that has one, then SVT-AV1.
+const AV1_ENCODERS: [&str; 4] = ["av1_nvenc", "av1_amf", "av1_qsv", "libsvtav1"];
+
+/// VP9 encoders to try, best first.
+const VP9_ENCODERS: [&str; 2] = ["vp9_qsv", "libvpx-vp9"];
 
 /// The arguments that make H.265 with `encoder` at about `kbps`, for a file
 /// (so, unlike `h264_args`, nothing is tuned for latency).
@@ -210,6 +255,10 @@ pub fn hevc_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "hevc_nvenc" => add(&["-preset", "p4", "-pix_fmt", "yuv420p"]),
         "hevc_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
         "hevc_amf" => add(&["-usage", "transcoding", "-pix_fmt", "yuv420p"]),
+        "hevc_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
+        "hevc_d3d12va" => add(&D3D12_ARGS),
+        "hevc_vaapi" => add(&VAAPI_ARGS),
+        "libkvazaar" => add(&["-kvazaar-params", "preset=veryfast", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
     // `hvc1` is the tag QuickTime and Apple's players need to open H.265.
@@ -217,6 +266,119 @@ pub fn hevc_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "-tag:v", "hvc1", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf, "-g", &gop,
     ]);
     a
+}
+
+/// The bit rate, buffer size and keyframe spacing every stream encoder is given:
+/// a keyframe every two seconds, so a viewer joining late waits no longer, and no
+/// B-frames (a browser's WebRTC player can't show them, and some hardware encoders
+/// use them unless told not to).
+fn live_rate_args(kbps: u32, fps: u32) -> Vec<String> {
+    let kbps = kbps.clamp(200, 100_000);
+    let rate = format!("{kbps}k");
+    let buf = format!("{}k", kbps * 2);
+    let gop = (fps.max(1) * 2).to_string();
+    [
+        "-bf", "0", "-b:v", &rate, "-maxrate", &rate, "-bufsize", &buf, "-g", &gop,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// H.265 for a live viewer: tuned for latency, no B-frames, and without the `hvc1`
+/// tag that `hevc_args` puts on a file for QuickTime.
+pub fn hevc_stream_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    let mut a: Vec<String> = ["-c:v", encoder].map(String::from).to_vec();
+    let mut add = |more: &[&str]| a.extend(more.iter().map(|s| s.to_string()));
+    match encoder {
+        "libx265" => add(&[
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+        ]),
+        "hevc_videotoolbox" => add(&["-realtime", "1", "-pix_fmt", "yuv420p"]),
+        "hevc_nvenc" => add(&["-preset", "p4", "-tune", "ll", "-pix_fmt", "yuv420p"]),
+        "hevc_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
+        // `webcam` is low latency and keeps the keyframe spacing (see `h264_args`).
+        "hevc_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
+        "hevc_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
+        "hevc_d3d12va" => add(&D3D12_ARGS),
+        "hevc_vaapi" => add(&VAAPI_ARGS),
+        "libkvazaar" => add(&[
+            "-kvazaar-params",
+            "preset=ultrafast",
+            "-vf",
+            KVAZAAR_FILTER,
+            "-pix_fmt",
+            "yuv420p",
+        ]),
+        _ => add(&["-pix_fmt", "yuv420p"]),
+    }
+    a.extend(live_rate_args(kbps, fps));
+    a
+}
+
+/// AV1 for a live viewer.
+pub fn av1_stream_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    let mut a: Vec<String> = ["-c:v", encoder].map(String::from).to_vec();
+    let mut add = |more: &[&str]| a.extend(more.iter().map(|s| s.to_string()));
+    match encoder {
+        "av1_nvenc" => add(&["-preset", "p4", "-tune", "ll", "-pix_fmt", "yuv420p"]),
+        "av1_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
+        "av1_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
+        // Presets 10 to 12 are the real-time ones.
+        "libsvtav1" => add(&["-preset", "10", "-pix_fmt", "yuv420p"]),
+        _ => add(&["-pix_fmt", "yuv420p"]),
+    }
+    let mut rate = live_rate_args(kbps, fps);
+    // SVT-AV1 refuses a `-maxrate` (it fails to start).
+    if encoder == "libsvtav1"
+        && let Some(at) = rate.iter().position(|x| x == "-maxrate")
+    {
+        rate.drain(at..at + 2);
+    }
+    a.extend(rate);
+    a
+}
+
+/// VP9 for a live viewer.
+pub fn vp9_stream_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    let mut a: Vec<String> = ["-c:v", encoder].map(String::from).to_vec();
+    let mut add = |more: &[&str]| a.extend(more.iter().map(|s| s.to_string()));
+    match encoder {
+        "libvpx-vp9" => add(&[
+            "-deadline",
+            "realtime",
+            "-cpu-used",
+            "8",
+            "-row-mt",
+            "1",
+            "-lag-in-frames",
+            "0",
+            "-auto-alt-ref",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+        ]),
+        "vp9_qsv" => add(&["-pix_fmt", "nv12"]),
+        _ => add(&["-pix_fmt", "yuv420p"]),
+    }
+    a.extend(live_rate_args(kbps, fps));
+    a
+}
+
+/// The arguments that make video with `encoder` (any codec in `encoders::ALL`)
+/// for a live viewer at about `kbps`.
+pub fn video_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
+    use crate::show::VideoCodec;
+    match crate::encoders::find(encoder).map(|e| e.codec) {
+        Some(VideoCodec::H265) => hevc_stream_args(encoder, kbps, fps),
+        Some(VideoCodec::Av1) => av1_stream_args(encoder, kbps, fps),
+        Some(VideoCodec::Vp9) => vp9_stream_args(encoder, kbps, fps),
+        _ => h264_args(encoder, kbps, fps),
+    }
 }
 
 /// Where a recording is written: the folder (Downloads if empty), and a name
@@ -354,19 +516,24 @@ pub fn server_url(
     })
 }
 
-/// FFmpeg's output arguments for `kind`, for a picture at `fps`. `h264` is the
-/// H.264 encoder this FFmpeg has and that works on this computer (`encoder`),
-/// which the network and server streams use.
+/// FFmpeg's output arguments for `kind`, for a picture at `fps`. `chosen` is the
+/// encoder this FFmpeg has and that works on this computer for the stream's codec
+/// (`encoder`, or `server_encoder` for a server), which the network, server and
+/// recording streams use.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn output_args(kind: &StreamKind, h264: Option<&str>, fps: u32) -> Result<Vec<String>, String> {
-    output_args_to(kind, h264, fps, None)
+pub fn output_args(
+    kind: &StreamKind,
+    chosen: Option<&str>,
+    fps: u32,
+) -> Result<Vec<String>, String> {
+    output_args_to(kind, chosen, fps, None)
 }
 
 /// `output_args`, with the file a recording is written to when it has been chosen
 /// already (see `reserve_record_file`).
 pub fn output_args_to(
     kind: &StreamKind,
-    h264: Option<&str>,
+    chosen: Option<&str>,
     fps: u32,
     record_file: Option<&std::path::Path>,
 ) -> Result<Vec<String>, String> {
@@ -393,7 +560,7 @@ pub fn output_args_to(
             if host.is_empty() {
                 return Err("no address to send to".into());
             }
-            let mut a = match h264 {
+            let mut a = match chosen {
                 Some(enc) => h264_args(enc, 4000, fps),
                 None => list(&["-c:v", "mpeg4", "-q:v", "3", "-pix_fmt", "yuv420p"]),
             };
@@ -409,8 +576,12 @@ pub fn output_args_to(
             kbps,
             adapter,
             host_here,
+            codec,
             ..
         } => {
+            if let Some(why) = crate::encoders::protocol_problem(*codec, *protocol) {
+                return Err(why);
+            }
             // A server NewQ runs is on this computer, whatever the box says.
             let host = if *host_here {
                 "127.0.0.1"
@@ -420,12 +591,21 @@ pub fn output_args_to(
             let host =
                 crate::streamlink::publish_host(host, adapter, &crate::streamlink::adapters());
             let url = server_url(*protocol, &host, *port, path)?;
-            let Some(enc) = h264 else {
-                return Err(NO_H264.into());
+            let Some(enc) = chosen else {
+                return Err(no_encoder(*codec));
             };
-            let mut a = h264_args(enc, *kbps, fps);
+            let mut a = video_args(enc, *kbps, fps);
             match protocol {
-                ServerProtocol::Rtsp => a.extend(list(&["-f", "rtsp", "-rtsp_transport", "tcp"])),
+                ServerProtocol::Rtsp => {
+                    // FFmpeg's RTP packetizers for AV1 and VP9 are marked experimental.
+                    if matches!(
+                        codec,
+                        crate::show::VideoCodec::Av1 | crate::show::VideoCodec::Vp9
+                    ) {
+                        a.extend(list(&["-strict", "experimental"]));
+                    }
+                    a.extend(list(&["-f", "rtsp", "-rtsp_transport", "tcp"]));
+                }
                 ServerProtocol::Rtmp => a.extend(list(&["-f", "flv"])),
                 ServerProtocol::Srt => a.extend(list(&["-f", "mpegts"])),
             }
@@ -442,7 +622,7 @@ pub fn output_args_to(
             audio,
         } => {
             // `encoder` is the one for the codec (see `Sink::start`).
-            let Some(enc) = h264 else {
+            let Some(enc) = chosen else {
                 return Err(match codec {
                     crate::show::RecordCodec::H264 => NO_H264,
                     crate::show::RecordCodec::H265 => NO_HEVC,
@@ -460,6 +640,9 @@ pub fn output_args_to(
             match codec {
                 crate::show::RecordCodec::H264 => a.extend(record_h264_args(enc, *kbps, fps)),
                 crate::show::RecordCodec::H265 => a.extend(hevc_args(enc, *kbps, fps)),
+            }
+            if enc == "libkvazaar" {
+                add_filter(&mut a, KVAZAAR_FILTER);
             }
             if audio.is_some() {
                 a.extend(list(&[
@@ -509,12 +692,28 @@ pub fn output_args_to(
 }
 
 const NO_H264: &str = "This computer's FFmpeg has no H.264 encoder that works here (libx264, or \
-    VideoToolbox, NVENC, Quick Sync or AMF with its hardware): use a Custom FFmpeg output or \
-    install an FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
+    OpenH264, or NVENC, Quick Sync, AMF, Media Foundation or Direct3D 12 with its hardware): \
+    use a Custom FFmpeg output or install an FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
 
-const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, or \
-    VideoToolbox, NVENC, Quick Sync or AMF with its hardware): record as H.264, or install an FFmpeg \
-    with libx265 and point NEWQ_FFMPEG_DIR at it";
+/// What to say when no encoder of `codec` works here.
+fn no_encoder(codec: crate::show::VideoCodec) -> String {
+    use crate::show::VideoCodec;
+    match codec {
+        VideoCodec::H264 => NO_H264.into(),
+        VideoCodec::H265 => NO_HEVC.into(),
+        VideoCodec::Av1 => "This computer has no AV1 encoder that works here (SVT-AV1 in the \
+            software, or an NVIDIA RTX 40, AMD RDNA 3 or Intel Arc graphics card): choose H.264 \
+            or H.265"
+            .into(),
+        VideoCodec::Vp9 => "This computer's FFmpeg has no VP9 encoder that works here \
+            (libvpx-vp9, or an Intel graphics card): choose H.264"
+            .into(),
+    }
+}
+
+const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, \
+    Kvazaar, or NVENC, Quick Sync, AMF, Media Foundation or Direct3D 12 with its hardware): use \
+    H.264, or install an FFmpeg with libx265 and point NEWQ_FFMPEG_DIR at it";
 
 /// What this FFmpeg can do, asked once: its encoders, muxers and protocols.
 struct Caps {
@@ -558,11 +757,7 @@ fn encoder_works(ff: &Ffmpeg, encoder: &str) -> bool {
     let mut cmd = ff.command();
     cmd.args(["-f", "lavfi", "-i", "color=c=black:s=640x360:r=30"])
         .args(["-frames:v", "8"])
-        .args(if HEVC_ENCODERS.contains(&encoder) {
-            hevc_args(encoder, 1000, 30)
-        } else {
-            h264_args(encoder, 1000, 30)
-        })
+        .args(video_args(encoder, 1000, 30))
         .args(["-f", "null", "-"]);
     // Nothing is read from it, and a driver that hangs must not hang a stream.
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -607,52 +802,243 @@ pub fn encoder(ff: &Ffmpeg) -> Option<&'static str> {
     Some(FOUND.get_or_init(|| e))
 }
 
-/// The H.265 encoder to use with `ff`, if there is one that works (as `encoder`).
-pub fn hevc_encoder(ff: &Ffmpeg) -> Option<&'static str> {
-    static FOUND: OnceLock<&'static str> = OnceLock::new();
-    if let Some(e) = FOUND.get() {
+/// The first of `list` that this FFmpeg has and that works here, remembered in
+/// `found` (see `encoder`).
+fn first_working(
+    ff: &Ffmpeg,
+    list: &[&'static str],
+    found: &'static OnceLock<&'static str>,
+) -> Option<&'static str> {
+    if let Some(e) = found.get() {
         return Some(e);
     }
     let c = caps(ff);
-    let e = HEVC_ENCODERS
-        .into_iter()
+    let e = list
+        .iter()
+        .copied()
         .find(|e| lists(&c.encoders, e) && encoder_works(ff, e))?;
-    Some(FOUND.get_or_init(|| e))
+    Some(found.get_or_init(|| e))
 }
 
-/// The H.264 encoder the user asked for by FFmpeg's name, if this FFmpeg has
-/// it. It is not test-encoded: a hardware encoder that isn't there says so
-/// itself when the stream starts.
+/// The H.265 encoder to use with `ff`, if there is one that works (as `encoder`).
+pub fn hevc_encoder(ff: &Ffmpeg) -> Option<&'static str> {
+    static FOUND: OnceLock<&'static str> = OnceLock::new();
+    first_working(ff, &HEVC_ENCODERS, &FOUND)
+}
+
+/// The AV1 encoder to use with `ff`, if there is one that works (as `encoder`).
+pub fn av1_encoder(ff: &Ffmpeg) -> Option<&'static str> {
+    static FOUND: OnceLock<&'static str> = OnceLock::new();
+    first_working(ff, &AV1_ENCODERS, &FOUND)
+}
+
+/// The VP9 encoder to use with `ff`, if there is one that works (as `encoder`).
+pub fn vp9_encoder(ff: &Ffmpeg) -> Option<&'static str> {
+    static FOUND: OnceLock<&'static str> = OnceLock::new();
+    first_working(ff, &VP9_ENCODERS, &FOUND)
+}
+
+/// The encoder the user asked for by FFmpeg's name, if this FFmpeg has it. It
+/// is not test-encoded: a hardware encoder that isn't there says so itself
+/// when the stream starts.
 pub fn encoder_named(ff: &Ffmpeg, wanted: &str) -> Result<&'static str, String> {
     let wanted = wanted.trim();
-    let Some(known) = H264_ENCODERS.into_iter().find(|e| *e == wanted) else {
-        return Err(format!("{wanted} is not an H.264 encoder NewQ knows"));
+    let Some(known) = crate::encoders::find(wanted) else {
+        return Err(format!("{wanted} is not an encoder NewQ knows"));
     };
-    if lists(&caps(ff).encoders, known) {
-        Ok(known)
+    if lists(&caps(ff).encoders, known.name) {
+        Ok(known.name)
     } else {
         Err(format!(
-            "this FFmpeg has no {known} encoder: choose another"
+            "this FFmpeg has no {} encoder: choose another",
+            known.name
         ))
     }
 }
 
-/// What each H.264 encoder is, as a person would say it.
-pub fn encoder_label(name: &str) -> &'static str {
-    match name {
-        "libx264" => "x264 (software)",
-        "h264_videotoolbox" => "Apple VideoToolbox (hardware)",
-        "h264_nvenc" => "NVIDIA NVENC (hardware)",
-        "h264_qsv" => "Intel Quick Sync (hardware)",
-        "h264_amf" => "AMD AMF (hardware)",
-        "libopenh264" => "OpenH264 (software)",
-        _ => "",
+/// Whether this FFmpeg has the encoder (the hardware may still be missing).
+pub fn encoder_present(ff: &Ffmpeg, name: &str) -> bool {
+    lists(&caps(ff).encoders, name)
+}
+
+/// The encoder for a stream to a server in `codec`: the one the user chose, which
+/// must make that codec and be in this FFmpeg, else the first of the codec's that
+/// works. None if there is none.
+pub fn server_encoder(
+    ff: &Ffmpeg,
+    codec: crate::show::VideoCodec,
+    wanted: &str,
+) -> Result<Option<&'static str>, String> {
+    if wanted.trim().is_empty() {
+        return Ok(auto_encoder(ff, codec));
+    }
+    let name = encoder_named(ff, wanted)?;
+    let known = crate::encoders::find(name).ok_or("an encoder NewQ lost track of")?;
+    if known.codec != codec {
+        return Err(format!(
+            "{} makes {}, but the stream is set to {}: choose another encoder",
+            known.label,
+            known.codec.label(),
+            codec.label()
+        ));
+    }
+    Ok(Some(name))
+}
+
+/// The first encoder of `codec` that works here.
+pub fn auto_encoder(ff: &Ffmpeg, codec: crate::show::VideoCodec) -> Option<&'static str> {
+    use crate::show::VideoCodec;
+    match codec {
+        VideoCodec::H264 => encoder(ff),
+        VideoCodec::H265 => hevc_encoder(ff),
+        VideoCodec::Av1 => av1_encoder(ff),
+        VideoCodec::Vp9 => vp9_encoder(ff),
     }
 }
 
-/// The names `encoder_named` accepts, best first.
-pub fn encoder_names() -> [&'static str; 6] {
-    H264_ENCODERS
+/// What a test of an encoder found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EncoderTest {
+    /// It encodes; `keyframes` is how many it sent in 3 seconds when that could be
+    /// counted (it should be 3, one every second: a viewer who joins late waits).
+    Works { keyframes: Option<u32> },
+    /// This FFmpeg doesn't have it.
+    Missing,
+    /// It is there but doesn't work here (no such hardware, a driver that refuses...).
+    Failed(String),
+}
+
+/// Try `name` on a few seconds of moving picture, as a stream would run it, and say
+/// whether it works and sends a keyframe often enough. Takes up to a few seconds.
+pub fn test_encoder(ff: &Ffmpeg, name: &str) -> EncoderTest {
+    use crate::show::VideoCodec;
+    let Some(known) = crate::encoders::find(name) else {
+        return EncoderTest::Failed(format!("{name} is not an encoder NewQ knows"));
+    };
+    if !encoder_present(ff, name) {
+        return EncoderTest::Missing;
+    }
+    // MPEG-TS holds H.264 and H.265 (and gets the Direct3D 12 ones, which Matroska
+    // refuses); Matroska holds the rest.
+    let (extension, container) = match known.codec {
+        VideoCodec::H264 | VideoCodec::H265 => ("ts", "mpegts"),
+        VideoCodec::Av1 | VideoCodec::Vp9 => ("mkv", "matroska"),
+    };
+    let file = std::env::temp_dir().join(format!(
+        "newq-encoder-test-{}-{}.{extension}",
+        std::process::id(),
+        name
+    ));
+    let mut cmd = ff.command();
+    // 3 seconds at 30 frames a second; the arguments are for 15, so a keyframe every 30 frames.
+    cmd.args(["-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"])
+        .args(["-t", "3"])
+        .args(video_args(name, 1000, 15))
+        .args(["-f", container])
+        .arg(&file);
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let Ok(mut child) = cmd.spawn() else {
+        return EncoderTest::Failed("could not start FFmpeg".into());
+    };
+    let err = child.stderr.take();
+    let said = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut e) = err {
+            let _ = std::io::Read::read_to_string(&mut e, &mut text);
+        }
+        text
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let ok = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&file);
+                return EncoderTest::Failed("it did not finish in 15 seconds".into());
+            }
+        }
+    };
+    let said = said.join().unwrap_or_default();
+    if !ok || std::fs::metadata(&file).map_or(true, |m| m.len() == 0) {
+        let _ = std::fs::remove_file(&file);
+        return EncoderTest::Failed(explain_failure(&said, name));
+    }
+    let keyframes = count_keyframes(ff, &file);
+    let _ = std::fs::remove_file(&file);
+    match keyframes {
+        Some(n) if n < 2 => EncoderTest::Failed(format!(
+            "it sent {n} keyframe(s) in 3 seconds: a viewer joining late would see nothing"
+        )),
+        other => EncoderTest::Works { keyframes: other },
+    }
+}
+
+/// What went wrong when `name` would not encode, from what FFmpeg said: the line the
+/// encoder itself gave ("Cannot load nvcuda.dll"), in plain words where it is a known one.
+fn explain_failure(said: &str, name: &str) -> String {
+    let own = format!("[{name} @");
+    let line = said
+        .lines()
+        .find(|l| l.contains(&own) && !l.contains("Error while opening encoder"))
+        .map(|l| {
+            l.split_once("] ")
+                .map_or(l, |(_, rest)| rest)
+                .trim()
+                .to_string()
+        });
+    let plain = |l: &str| -> Option<&'static str> {
+        let l = l.to_lowercase();
+        if l.contains("nvcuda") || l.contains("no nvenc capable") {
+            Some("no NVIDIA graphics card or driver here")
+        } else if l.contains("mfx session") || l.contains("mfx implementation") {
+            Some("no Intel Quick Sync hardware (or driver) here")
+        } else if l.contains("amf") && (l.contains("init") || l.contains("create")) {
+            Some("no AMD graphics card or driver that can do this here")
+        } else if l.contains("vaapi") || l.contains("/dev/dri") {
+            Some("no VAAPI graphics device here")
+        } else {
+            None
+        }
+    };
+    if let Some(l) = &line {
+        return plain(l).map_or_else(|| l.clone(), str::to_string);
+    }
+    // The encoder said nothing of its own: the last thing FFmpeg said that isn't the usual ending.
+    said.lines()
+        .rev()
+        .find(|l| {
+            let l = l.trim();
+            !l.is_empty()
+                && !l.contains("Conversion failed")
+                && !l.contains("Nothing was written")
+                && !l.contains("Task finished")
+                && !l.contains("Terminating thread")
+        })
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| "it failed".to_string())
+}
+
+/// How many keyframes `file` has, if FFmpeg's `ffprobe` is there to say.
+fn count_keyframes(ff: &Ffmpeg, file: &std::path::Path) -> Option<u32> {
+    let mut cmd = Command::new(&ff.ffprobe);
+    cmd.args(["-v", "error", "-select_streams", "v"])
+        .args(["-show_entries", "packet=flags", "-of", "csv=p=0"])
+        .arg(file);
+    crate::media::ffmpeg::no_console(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let n = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains('K'))
+        .count();
+    u32::try_from(n).ok()
 }
 
 /// Why `ff` can't publish `protocol`, if it can't.
@@ -953,8 +1339,10 @@ impl Sink {
             // that works.
             let chosen = match kind {
                 StreamKind::Server {
-                    encoder: wanted, ..
-                } if !wanted.trim().is_empty() => Some(encoder_named(ff, wanted)?),
+                    codec,
+                    encoder: wanted,
+                    ..
+                } => server_encoder(ff, *codec, wanted)?,
                 StreamKind::Record {
                     codec: crate::show::RecordCodec::H265,
                     ..
@@ -1913,6 +2301,7 @@ mod tests {
             adapter: String::new(),
             player_port: crate::show::default_player_port(),
             host_here: false,
+            codec: crate::show::VideoCodec::H264,
             encoder: String::new(),
         };
         let size = (320u32, 180u32);
@@ -1973,8 +2362,8 @@ mod tests {
 
     #[test]
     fn a_chosen_encoder_is_used_as_named_and_a_wrong_name_is_an_error() {
-        for name in encoder_names() {
-            assert!(!encoder_label(name).is_empty(), "{name} has no label");
+        for e in crate::encoders::ALL {
+            assert!(!e.label.is_empty(), "{} has no label", e.name);
         }
         let Some(ff) = Ffmpeg::locate() else {
             if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
@@ -1983,17 +2372,19 @@ mod tests {
             return;
         };
         let why = encoder_named(&ff, "not_an_encoder").unwrap_err();
-        assert!(why.contains("not an H.264 encoder NewQ knows"), "{why}");
+        assert!(why.contains("not an encoder NewQ knows"), "{why}");
         // One this FFmpeg lists is returned as named, with no test encode.
-        if let Some(listed) = encoder_names()
-            .into_iter()
+        if let Some(listed) = crate::encoders::ALL
+            .iter()
+            .map(|e| e.name)
             .find(|n| lists(&caps(&ff).encoders, n))
         {
             assert_eq!(encoder_named(&ff, &format!(" {listed} ")), Ok(listed));
         }
         // One it doesn't list says so, naming it.
-        if let Some(missing) = encoder_names()
-            .into_iter()
+        if let Some(missing) = crate::encoders::ALL
+            .iter()
+            .map(|e| e.name)
             .find(|n| !lists(&caps(&ff).encoders, n))
         {
             let why = encoder_named(&ff, missing).unwrap_err();
@@ -2009,6 +2400,241 @@ mod tests {
         }
         let args = output_args(&kind, Some("libopenh264"), 30).unwrap();
         assert_eq!(&args[..2], ["-c:v", "libopenh264"]);
+    }
+
+    #[test]
+    fn every_encoder_is_given_a_keyframe_every_two_seconds_no_b_frames_and_its_own_settings() {
+        for e in crate::encoders::ALL {
+            let a = video_args(e.name, 4000, 30);
+            assert_eq!(&a[..2], ["-c:v", e.name], "{}", e.name);
+            let value = |flag: &str| {
+                a.iter()
+                    .position(|x| x == flag)
+                    .and_then(|i| a.get(i + 1))
+                    .cloned()
+            };
+            assert_eq!(value("-g").as_deref(), Some("60"), "{} keyframes", e.name);
+            assert_eq!(value("-bf").as_deref(), Some("0"), "{} B-frames", e.name);
+            assert_eq!(value("-b:v").as_deref(), Some("4000k"), "{} rate", e.name);
+            assert!(
+                !a.contains(&"-tag:v".to_string()),
+                "{} is for a file",
+                e.name
+            );
+        }
+        // A graphics card reached through Direct3D 12 or VAAPI is given its device and the picture.
+        for name in ["h264_d3d12va", "hevc_d3d12va"] {
+            let a = video_args(name, 4000, 30).join(" ");
+            assert!(
+                a.contains("-init_hw_device d3d12va=d3 -filter_hw_device d3"),
+                "{a}"
+            );
+            assert!(a.contains("-vf format=nv12,hwupload"), "{a}");
+        }
+        assert!(
+            video_args("h264_vaapi", 4000, 30)
+                .join(" ")
+                .contains("hwupload")
+        );
+        // Media Foundation is asked for the hardware, not Microsoft's software encoder.
+        for name in ["h264_mf", "hevc_mf"] {
+            assert!(
+                video_args(name, 4000, 30)
+                    .join(" ")
+                    .contains("-hw_encoding 1")
+            );
+        }
+        // Kvazaar is trimmed to a size it takes, in a stream and in a recording that crops.
+        assert!(
+            video_args("libkvazaar", 4000, 30)
+                .join(" ")
+                .contains("-vf crop=trunc(iw/8)*8:trunc(ih/8)*8")
+        );
+        let mut a: Vec<String> = ["-y", "-vf", "crop=100:100", "-c:v", "x"]
+            .map(String::from)
+            .to_vec();
+        add_filter(&mut a, "scale=2:2");
+        assert_eq!(a.join(" "), "-y -vf crop=100:100,scale=2:2 -c:v x");
+        let mut b: Vec<String> = vec!["-c:v".into(), "x".into()];
+        add_filter(&mut b, "scale=2:2");
+        assert_eq!(b.join(" "), "-c:v x -vf scale=2:2");
+        // The ones that were here keep their settings.
+        assert_eq!(
+            video_args("h264_amf", 4000, 30),
+            h264_args("h264_amf", 4000, 30)
+        );
+        assert!(
+            video_args("h264_amf", 4000, 30)
+                .join(" ")
+                .contains("-usage webcam")
+        );
+        // The rate is kept in range.
+        assert!(video_args("libsvtav1", 5, 30).contains(&"200k".to_string()));
+        assert!(video_args("libsvtav1", 9_000_000, 30).contains(&"100000k".to_string()));
+        // SVT-AV1 fails to start with a -maxrate; the others are given one.
+        assert!(!video_args("libsvtav1", 4000, 30).contains(&"-maxrate".to_string()));
+        assert!(video_args("libvpx-vp9", 4000, 30).contains(&"-maxrate".to_string()));
+    }
+
+    #[test]
+    fn a_failed_encoder_test_says_what_the_encoder_said_in_plain_words() {
+        let nvenc = "[h264_nvenc @ 0000010] Cannot load nvcuda.dll\n[vost#0:0/h264_nvenc @ 0000011] [enc:h264_nvenc @ 0000012] Error while opening encoder - maybe incorrect parameters\n[vf#0:0 @ 00] Task finished with error code: -1\nConversion failed!";
+        assert_eq!(
+            explain_failure(nvenc, "h264_nvenc"),
+            "no NVIDIA graphics card or driver here"
+        );
+        let qsv = "[h264_qsv @ 0000014c] Error creating a MFX session: -9.\n[h264_qsv @ 0000014c] The current mfx implementation is not supported\nConversion failed!";
+        assert_eq!(
+            explain_failure(qsv, "h264_qsv"),
+            "no Intel Quick Sync hardware (or driver) here"
+        );
+        // Its own words when they are not a known case.
+        let odd = "[libx264 @ 00] something unusual happened\nConversion failed!";
+        assert_eq!(
+            explain_failure(odd, "libx264"),
+            "something unusual happened"
+        );
+        // Nothing of its own: the last line that isn't the usual ending.
+        let plain = "Unknown encoder 'nope'\n[out#0/null @ 0] Nothing was written into output file\nConversion failed!";
+        assert_eq!(explain_failure(plain, "nope"), "Unknown encoder 'nope'");
+        assert_eq!(explain_failure("", "x"), "it failed");
+    }
+
+    #[test]
+    fn a_server_stream_asks_for_its_codec_and_its_protocol_must_carry_it() {
+        use crate::show::VideoCodec;
+        let server = |protocol, codec, enc: &str| {
+            let mut k = StreamKind::server(protocol);
+            if let StreamKind::Server {
+                codec: c, encoder, ..
+            } = &mut k
+            {
+                *c = codec;
+                *encoder = enc.into();
+            }
+            k
+        };
+        let flags = |k: &StreamKind, enc: &str| output_args(k, Some(enc), 30).unwrap().join(" ");
+        // H.265 over each protocol.
+        for p in ServerProtocol::ALL {
+            let a = flags(&server(p, VideoCodec::H265, ""), "hevc_amf");
+            assert!(a.starts_with("-c:v hevc_amf"), "{a}");
+            assert!(!a.contains("-strict"), "{a}");
+        }
+        // AV1 and VP9 over RTSP need FFmpeg's experimental RTP packetizers; over RTMP they don't.
+        for (codec, enc) in [
+            (VideoCodec::Av1, "libsvtav1"),
+            (VideoCodec::Vp9, "libvpx-vp9"),
+        ] {
+            let rtsp = flags(&server(ServerProtocol::Rtsp, codec, ""), enc);
+            assert!(rtsp.contains("-strict experimental -f rtsp"), "{rtsp}");
+            let rtmp = flags(&server(ServerProtocol::Rtmp, codec, ""), enc);
+            assert!(
+                rtmp.contains("-f flv") && !rtmp.contains("-strict"),
+                "{rtmp}"
+            );
+            // SRT can't carry them, and says what to do instead.
+            let why =
+                output_args(&server(ServerProtocol::Srt, codec, ""), Some(enc), 30).unwrap_err();
+            assert!(why.contains("SRT") && why.contains("RTSP"), "{why}");
+        }
+        // No encoder that works is said in the codec's own words.
+        for codec in VideoCodec::ALL {
+            let why = output_args(&server(ServerProtocol::Rtsp, codec, ""), None, 30).unwrap_err();
+            assert!(why.contains("encoder"), "{why}");
+        }
+        assert!(no_encoder(VideoCodec::Av1).contains("AV1"));
+        assert!(no_encoder(VideoCodec::H265).contains("H.265"));
+    }
+
+    #[test]
+    fn an_encoder_for_another_codec_is_refused_and_the_ones_this_ffmpeg_has_are_tested_for_real() {
+        use crate::show::VideoCodec;
+        let Some(ff) = Ffmpeg::locate() else {
+            if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+                panic!("NEWQ_REQUIRE_MEDIA is set but ffmpeg was not found");
+            }
+            return;
+        };
+        // One this FFmpeg has, for the wrong codec.
+        if let Some(h264) =
+            crate::encoders::for_codec(VideoCodec::H264).find(|e| encoder_present(&ff, e.name))
+        {
+            let why = server_encoder(&ff, VideoCodec::H265, h264.name).unwrap_err();
+            assert!(why.contains("H.264") && why.contains("H.265"), "{why}");
+            assert_eq!(
+                server_encoder(&ff, VideoCodec::H264, h264.name),
+                Ok(Some(h264.name))
+            );
+        }
+        assert!(server_encoder(&ff, VideoCodec::Av1, "nonsense").is_err());
+        // One it doesn't have is Missing, not a failure.
+        assert_eq!(
+            test_encoder(&ff, "libx264").clone(),
+            if encoder_present(&ff, "libx264") {
+                test_encoder(&ff, "libx264")
+            } else {
+                EncoderTest::Missing
+            }
+        );
+        // The software encoders are on every computer: they must work, and send a keyframe a second.
+        let mut tried = 0;
+        for name in [
+            "libopenh264",
+            "libkvazaar",
+            "libx264",
+            "libx265",
+            "libsvtav1",
+            "libvpx-vp9",
+        ] {
+            if !encoder_present(&ff, name) {
+                continue;
+            }
+            tried += 1;
+            match test_encoder(&ff, name) {
+                EncoderTest::Works { keyframes } => {
+                    if let Some(n) = keyframes {
+                        assert!(
+                            (2..=4).contains(&n),
+                            "{name}: about one a second for 3 seconds, got {n}"
+                        );
+                    }
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+            assert!(tried >= 1, "no software encoder to test");
+        }
+        // Streams are not always a size every encoder likes: Kvazaar wants multiples of 8.
+        for name in ["libkvazaar", "libopenh264", "libsvtav1", "libvpx-vp9"] {
+            if !encoder_present(&ff, name) {
+                continue;
+            }
+            for size in ["854x480", "1366x768", "1000x562"] {
+                let out = ff
+                    .command()
+                    .args(["-f", "lavfi", "-i"])
+                    .arg(format!("testsrc2=size={size}:rate=30"))
+                    .args(["-t", "1"])
+                    .args(video_args(name, 2000, 30))
+                    .args(["-f", "null", "-"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{name} at {size}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+        // The hardware ones are tried too, and either work or say why not; none hangs or panics.
+        for e in crate::encoders::ALL
+            .iter()
+            .filter(|e| e.usable_here() && e.kind == crate::encoders::Kind::Hardware)
+        {
+            eprintln!("{}: {:?}", e.name, test_encoder(&ff, e.name));
+        }
     }
 
     #[test]

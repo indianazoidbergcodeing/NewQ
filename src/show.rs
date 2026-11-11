@@ -650,7 +650,7 @@ pub enum StreamKind {
         ntsc: bool,
     },
     /// Publishing to a streaming server such as MediaMTX, which then serves the
-    /// picture to any number of viewers (RTSP, RTMP or SRT). H.264, picture only.
+    /// picture to any number of viewers (RTSP, RTMP or SRT). Picture only.
     Server {
         protocol: ServerProtocol,
         host: String,
@@ -675,11 +675,42 @@ pub enum StreamKind {
         /// that is already running: the address above is then this computer.
         #[serde(default, skip_serializing_if = "is_false")]
         host_here: bool,
-        /// The H.264 encoder to use (FFmpeg's name, `h264_amf`), or empty to
-        /// let NewQ pick the first one that works.
+        /// The video codec: H.264 unless chosen.
+        #[serde(default, skip_serializing_if = "VideoCodec::is_h264")]
+        codec: VideoCodec,
+        /// The encoder to use for that codec (FFmpeg's name, `h264_amf`), or
+        /// empty to let NewQ pick the first one that works.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         encoder: String,
     },
+}
+
+/// The video codec of a stream to a streaming server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCodec {
+    /// Every viewer can play it, in a browser too.
+    #[default]
+    H264,
+    H265,
+    Av1,
+    Vp9,
+}
+
+impl VideoCodec {
+    pub const ALL: [VideoCodec; 4] = [Self::H264, Self::H265, Self::Av1, Self::Vp9];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::H265 => "H.265 (HEVC)",
+            Self::Av1 => "AV1",
+            Self::Vp9 => "VP9",
+        }
+    }
+
+    pub fn is_h264(&self) -> bool {
+        *self == Self::H264
+    }
 }
 
 /// The video codec of a recording.
@@ -852,6 +883,7 @@ impl StreamKind {
             adapter: String::new(),
             player_port: default_player_port(),
             host_here: false,
+            codec: VideoCodec::H264,
             encoder: String::new(),
         }
     }
@@ -4932,7 +4964,8 @@ mod tests {
                 adapter: "en0".into(),
                 player_port: 8890,
                 host_here: true,
-                encoder: "libopenh264".into(),
+                codec: VideoCodec::H265,
+                encoder: "libkvazaar".into(),
             },
             fps: 30,
             height: 1080,
@@ -4967,7 +5000,7 @@ mod tests {
         );
         // Written again, the new fields are left out while they hold their defaults...
         let json = serde_json::to_string(&s).unwrap();
-        for field in ["adapter", "player_port", "host_here", "encoder"] {
+        for field in ["adapter", "player_port", "host_here", "encoder", "codec"] {
             assert!(!json.contains(field), "{field} written: {json}");
         }
         // ...and kept once they are set.
@@ -4977,16 +5010,18 @@ mod tests {
             player_port,
             host_here,
             encoder,
+            codec,
             ..
         } = &mut set.kind
         {
-            *encoder = "h264_amf".into();
+            *codec = VideoCodec::Av1;
+            *encoder = "av1_amf".into();
             *adapter = "en0".into();
             *player_port = 8890;
             *host_here = true;
         }
         let json = serde_json::to_string(&set).unwrap();
-        for field in ["adapter", "player_port", "host_here", "encoder"] {
+        for field in ["adapter", "player_port", "host_here", "encoder", "codec"] {
             assert!(json.contains(field), "{field} lost: {json}");
         }
         assert_eq!(serde_json::from_str::<StreamOut>(&json).unwrap(), set);

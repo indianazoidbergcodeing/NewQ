@@ -263,8 +263,18 @@ The README describes the features; this file is about working on the code.
   (argument building, `Sink`); `render.rs::CaptureThread` draws the picture off
   screen at the stream's rate and feeds it. A test streams to a file through
   real FFmpeg; the Linux virtual camera itself can't be tested here.
-  `StreamKind::Server` (RTSP/RTMP/SRT to MediaMTX and the like) takes its H.264 encoder from
-  `stream::encoder` (libx264, then VideoToolbox, NVENC, QSV, AMF: listed *and* proven by a short
+  `StreamKind::Server` (RTSP/RTMP/SRT to MediaMTX and the like) has a `codec` (`show::VideoCodec`: H.264, H.265, AV1,
+  VP9) and an `encoder` (FFmpeg's name, empty = Automatic). `encoders.rs` is the catalogue (name, codec, hardware or
+  software, label, `usable_here`, `protocol_problem`: SRT carries only H.264 and H.265, found by publishing each to
+  a real MediaMTX) and `stream::video_args` builds the arguments per encoder (`h264_args`, `hevc_stream_args`,
+  `av1_stream_args`, `vp9_stream_args`; a keyframe every two seconds and no B-frames for all; AV1/VP9 over RTSP
+  also get `-strict experimental`; SVT-AV1 refuses `-maxrate`; libvpx needs `-lag-in-frames 0` or it buffers a
+  second; Kvazaar needs a size that is a multiple of 8, `KVAZAAR_FILTER`; the Direct3D 12 and VAAPI ones take
+  `-vf format=nv12,hwupload` and a device). Automatic is `stream::auto_encoder` (`server_encoder` checks a chosen one
+  makes the stream's codec); `test_encoder` (the Send out list's Test encoders button, via `ui::encoder_picker`) encodes
+  3 s and counts keyframes with ffprobe, and `explain_failure` turns FFmpeg's complaint into words. The H.264
+  encoder for Automatic comes from
+  `stream::encoder` (libx264, then VideoToolbox, NVENC, QSV, AMF, OpenH264: listed *and* proven by a short
   test encode, once per run), and `missing_for` checks the muxer and protocol (the Mac bundle has
   no libsrt, so no SRT). The Mac FFmpeg is built with network on and the `mpegts,rtsp,rtp,flv`
   muxers for this; `package_release.sh::verify_ffmpeg` checks them. Tests publish to FFmpeg's own

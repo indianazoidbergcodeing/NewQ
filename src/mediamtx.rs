@@ -944,6 +944,7 @@ mod tests {
             adapter: adapter.into(),
             player_port: player,
             host_here: here,
+            codec: crate::show::VideoCodec::H264,
             encoder: String::new(),
         }
     }
@@ -1065,6 +1066,147 @@ mod tests {
         assert!(first.failed().is_none(), "the first sender was pushed out");
         first.finish();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Every codec NewQ can send, over each protocol that should carry it, with the
+    /// software encoder (every computer has one), to a real MediaMTX, read back as
+    /// a viewer would. This is what the protocol table in `encoders` rests on.
+    #[test]
+    fn each_codec_publishes_to_the_hosted_server_over_the_protocols_that_carry_it() {
+        use crate::media::ffmpeg::Ffmpeg;
+        use crate::show::{ServerProtocol, StreamKind, VideoCodec};
+        use crate::stream::{Sink, encoder_present};
+        let (Some(exe), Some(ff)) = (locate(), Ffmpeg::locate()) else {
+            eprintln!("needs MediaMTX and FFmpeg: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("newq-mtx-codecs-{}", std::process::id()));
+        let hosting = Hosting {
+            listen: Some(Ipv4Addr::LOCALHOST.into()),
+            rtsp: free_port(),
+            rtmp: free_port(),
+            srt: free_port(),
+            player: free_port(),
+            hls: free_port(),
+            ice: free_port(),
+            rtp: 0,
+        };
+        let mut server = Hosted::start(&exe, &dir, hosting).expect("start");
+        assert!((0..50).any(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            crate::streamlink::tcp_probe("127.0.0.1", hosting.rtsp, Duration::from_millis(200))
+                .is_ok()
+        }));
+        let size = (320u32, 180u32);
+        let frame = [40u8, 120, 200, 255].repeat((size.0 * size.1) as usize);
+        let mut played = Vec::new();
+        for (codec, candidates) in [
+            (VideoCodec::H264, ["libopenh264", "libx264"]),
+            (VideoCodec::H265, ["libkvazaar", "libx265"]),
+            (VideoCodec::Av1, ["libsvtav1", "libsvtav1"]),
+            (VideoCodec::Vp9, ["libvpx-vp9", "libvpx-vp9"]),
+        ] {
+            let Some(encoder) = candidates.into_iter().find(|e| encoder_present(&ff, e)) else {
+                continue;
+            };
+            for protocol in ServerProtocol::ALL {
+                if crate::encoders::protocol_problem(codec, protocol).is_some() {
+                    continue;
+                }
+                let name = format!("{}_{}", encoder.replace('-', "_"), protocol.label());
+                let mut kind = StreamKind::server(protocol);
+                if let StreamKind::Server {
+                    port,
+                    host_here,
+                    path,
+                    codec: c,
+                    encoder: e,
+                    ..
+                } = &mut kind
+                {
+                    *port = match protocol {
+                        ServerProtocol::Rtsp => hosting.rtsp,
+                        ServerProtocol::Rtmp => hosting.rtmp,
+                        ServerProtocol::Srt => hosting.srt,
+                    };
+                    *host_here = true;
+                    *path = name.clone();
+                    *c = codec;
+                    *e = encoder.into();
+                }
+                let mut sink = match Sink::start(&ff, size, 25, &kind) {
+                    Ok(s) => s,
+                    // This FFmpeg can't publish that way (the Mac build has no SRT).
+                    Err(why) => {
+                        eprintln!("{name}: {why}: skipped");
+                        continue;
+                    }
+                };
+                let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = done.clone();
+                let sender = std::thread::spawn(move || {
+                    let mut said = None;
+                    for _ in 0..500 {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Err(e) = sink.write(&frame_clone()) {
+                            said = Some(e);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                    said = said.or_else(|| sink.failed());
+                    sink.finish();
+                    said
+                });
+                let mut got = None;
+                let mut last_error = String::new();
+                for _ in 0..40 {
+                    let out = ff
+                        .command()
+                        .args(["-rtsp_transport", "tcp", "-i"])
+                        .arg(format!("rtsp://127.0.0.1:{}/{name}", hosting.rtsp))
+                        .args(["-frames:v", "5", "-f", "null", "-"])
+                        .output()
+                        .unwrap();
+                    if out.status.success() {
+                        got = Some(());
+                        break;
+                    }
+                    last_error = String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .rev()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+                let said = sender.join().ok().flatten();
+                assert!(
+                    got.is_some(),
+                    "{} over {} never played back: {:?}; FFmpeg said {:?}; the reader said {}",
+                    codec.label(),
+                    protocol.label(),
+                    server.state(),
+                    said,
+                    last_error
+                );
+                played.push(name);
+            }
+        }
+        eprintln!("played back: {played:?}");
+        if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+            assert!(!played.is_empty(), "no codec could be tried");
+        }
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+
+        fn frame_clone() -> Vec<u8> {
+            [40u8, 120, 200, 255].repeat(320 * 180)
+        }
+        let _ = frame;
     }
 
     /// The whole chain with the real programs: NewQ runs MediaMTX, publishes a
