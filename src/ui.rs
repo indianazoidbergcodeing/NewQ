@@ -5039,14 +5039,33 @@ fn shared_picture_editor(
     }
 }
 
-/// Sending a display's picture out as video: to a virtual camera (Linux), to
-/// OBS over the network, or anywhere FFmpeg can send it.
-/// What the tests of the encoders have found so far (shared with the thread that runs them).
+/// What the tests of the encoders have found so far. One set for the whole program (a window of
+/// its own would otherwise run a second set at the same time), shared with the thread that runs them.
 #[derive(Default)]
 struct EncoderTests {
     results: Vec<(&'static str, crate::stream::EncoderTest)>,
     running: bool,
 }
+
+fn encoder_tests() -> &'static std::sync::Arc<parking_lot::Mutex<EncoderTests>> {
+    static TESTS: std::sync::OnceLock<std::sync::Arc<parking_lot::Mutex<EncoderTests>>> =
+        std::sync::OnceLock::new();
+    TESTS.get_or_init(Default::default)
+}
+
+/// Ends a run of the tests however its thread ends (a panic too), so the button never stays off.
+struct TestsDone(std::sync::Arc<parking_lot::Mutex<EncoderTests>>);
+
+impl Drop for TestsDone {
+    fn drop(&mut self) {
+        self.0.lock().running = false;
+    }
+}
+
+/// In a test: have the list of encoders open at once, as a click on it would.
+#[cfg(test)]
+pub(crate) static OPEN_ENCODER_LIST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The encoders of `codec` as a list to choose from: Automatic, then the graphics
 /// card's and the processor's, each marked when this FFmpeg doesn't have it, and
@@ -5060,27 +5079,49 @@ fn encoder_picker(
     encoder: &mut String,
 ) {
     use crate::encoders::{self, Kind};
-    let tests_id = egui::Id::new("newq_encoder_tests");
-    let tests: std::sync::Arc<parking_lot::Mutex<EncoderTests>> = ui.ctx().data_mut(|d| {
-        d.get_temp_mut_or_default::<std::sync::Arc<parking_lot::Mutex<EncoderTests>>>(tests_id)
-            .clone()
-    });
+    let tests = encoder_tests().clone();
     let shown = if encoder.is_empty() {
         "Automatic".to_string()
     } else {
         encoders::find(encoder).map_or_else(|| encoder.clone(), |e| e.full_label())
     };
+    #[cfg(test)]
+    let open = OPEN_ENCODER_LIST.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let open = false;
     ui.vertical(|ui| {
         egui::CollapsingHeader::new(shown)
             .id_salt(("encoder_list", key))
-            .default_open(false)
+            .default_open(open)
             .show(ui, |ui| {
+                // What this FFmpeg has is found on a thread the first time (a few runs of
+                // FFmpeg, which can take seconds); the window never waits for it.
+                if !ff.is_none_or(crate::stream::caps_ready) {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("checking what this computer's FFmpeg has…").weak());
+                    });
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(150));
+                    return;
+                }
                 let found = tests.lock().results.clone();
+                // A software encoder to suggest, if viewers see no picture: the first this FFmpeg has.
+                let advice = ff
+                    .and_then(|f| {
+                        encoders::for_codec(codec).find(|e| {
+                            e.kind == Kind::Software
+                                && e.usable_here()
+                                && crate::stream::encoder_present(f, e.name)
+                        })
+                    })
+                    .map(|e| format!(" If viewers see no picture, choose {} (software).", e.label))
+                    .unwrap_or_default();
                 if ui
                     .selectable_label(encoder.is_empty(), "Automatic (the first that works here)")
-                    .on_hover_text(
-                        "NewQ tries the encoders in turn and uses the first that works. If viewers see \n                         no picture, choose OpenH264 (software) for H.264.",
-                    )
+                    .on_hover_text(format!(
+                        "NewQ tries the encoders in turn and uses the first that works.{advice}"
+                    ))
                     .clicked()
                 {
                     encoder.clear();
@@ -5142,33 +5183,41 @@ fn encoder_picker(
                         .on_hover_text(
                             "Tries every encoder this FFmpeg has on a few seconds of picture, as a \
                              stream would use it, and says which work here and whether they send a \
-                             keyframe often enough. A hardware one fails when the computer \
-                             hasn't got that hardware.",
+                             keyframe often enough, in order. A hardware one fails when the \
+                             computer hasn't got that hardware.",
                         )
                         .clicked()
                         && let Some(ff) = ff.cloned()
                     {
-                        {
+                        // Checked and set under one lock: a second window can't start a second run.
+                        let start = {
                             let mut t = tests.lock();
-                            t.results.clear();
-                            t.running = true;
-                        }
-                        let shared = tests.clone();
-                        let spawned = std::thread::Builder::new()
-                            .name("encoder-tests".into())
-                            .spawn(move || {
-                                for e in encoders::ALL {
-                                    if e.usable_here()
-                                        && crate::stream::encoder_present(&ff, e.name)
-                                    {
-                                        let result = crate::stream::test_encoder(&ff, e.name);
-                                        shared.lock().results.push((e.name, result));
+                            if t.running {
+                                false
+                            } else {
+                                t.results.clear();
+                                t.running = true;
+                                true
+                            }
+                        };
+                        if start {
+                            let shared = tests.clone();
+                            let spawned = std::thread::Builder::new()
+                                .name("encoder-tests".into())
+                                .spawn(move || {
+                                    let _done = TestsDone(shared.clone());
+                                    for e in encoders::ALL {
+                                        if e.usable_here()
+                                            && crate::stream::encoder_present(&ff, e.name)
+                                        {
+                                            let result = crate::stream::test_encoder(&ff, e.name);
+                                            shared.lock().results.push((e.name, result));
+                                        }
                                     }
-                                }
-                                shared.lock().running = false;
-                            });
-                        if spawned.is_err() {
-                            tests.lock().running = false;
+                                });
+                            if spawned.is_err() {
+                                tests.lock().running = false;
+                            }
                         }
                     }
                     if running {
@@ -5182,6 +5231,8 @@ fn encoder_picker(
     });
 }
 
+/// Sending a display's picture out as video: to a virtual camera (Linux), to
+/// OBS over the network, or anywhere FFmpeg can send it.
 fn stream_editor(
     ui: &mut Ui,
     d: &mut OutputConfig,
@@ -14456,6 +14507,123 @@ mod tests {
             out.textures_delta.clear();
             assert!(out.shapes.len() > 3);
         }
+    }
+
+    /// All the text painted in a frame.
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_encoder_list_names_every_choice_for_each_codec_and_says_what_this_ffmpeg_lacks() {
+        use crate::show::{ServerProtocol, StreamKind, StreamOut, VideoCodec};
+        let ff = crate::media::ffmpeg::Ffmpeg::locate();
+        if let Some(ff) = &ff {
+            // What it has is found on a thread: wait for it.
+            for _ in 0..300 {
+                if crate::stream::caps_ready(ff) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(crate::stream::caps_ready(ff), "FFmpeg's list never came");
+        }
+        OPEN_ENCODER_LIST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let ctx = egui::Context::default();
+        let mut t = 1.0;
+        let cases: [(VideoCodec, &[&str]); 4] = [
+            (
+                VideoCodec::H264,
+                &[
+                    "OpenH264",
+                    "NVIDIA NVENC",
+                    "AMD AMF",
+                    "Intel Quick Sync",
+                    "x264",
+                ],
+            ),
+            (
+                VideoCodec::H265,
+                &["Kvazaar", "NVIDIA NVENC", "AMD AMF", "x265"],
+            ),
+            (VideoCodec::Av1, &["SVT-AV1", "NVIDIA NVENC", "AMD AMF"]),
+            (VideoCodec::Vp9, &["libvpx VP9", "Intel Quick Sync"]),
+        ];
+        for (codec, wanted) in cases {
+            let mut show = Show::default();
+            let mut kind = StreamKind::server(ServerProtocol::Rtsp);
+            if let StreamKind::Server { codec: c, .. } = &mut kind {
+                *c = codec;
+            }
+            show.outputs[0].stream = Some(StreamOut {
+                enabled: true,
+                kind,
+                fps: 30,
+                height: 720,
+            });
+            let mut engine = Engine::for_tests();
+            engine.ff = ff.clone();
+            let st = UiState::default();
+            let mut d = show.outputs[0].clone();
+            let mut text = String::new();
+            for _ in 0..3 {
+                t += 0.1;
+                let input = RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 1400.0))),
+                    time: Some(t),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| {
+                    stream_editor(ui, &mut d, &mut engine, &st, &[]);
+                });
+                out.textures_delta.clear();
+                text = painted_text(&out.shapes);
+            }
+            for w in wanted {
+                assert!(text.contains(w), "{codec:?}: no {w} in the list:\n{text}");
+            }
+            for w in [
+                "Test encoders",
+                "Graphics card (hardware)",
+                "Processor (software)",
+            ] {
+                assert!(text.contains(w), "{codec:?}: no {w}:\n{text}");
+            }
+            // Only the encoders this kind of computer can have are listed.
+            assert_eq!(
+                text.contains("Direct3D 12"),
+                cfg!(windows) && codec != VideoCodec::Av1 && codec != VideoCodec::Vp9
+            );
+            assert_eq!(
+                text.contains("VAAPI"),
+                cfg!(target_os = "linux") && matches!(codec, VideoCodec::H264 | VideoCodec::H265)
+            );
+            // Those this FFmpeg lacks are marked.
+            if let Some(ff) = &ff {
+                let missing = crate::encoders::for_codec(codec)
+                    .any(|e| e.usable_here() && !crate::stream::encoder_present(ff, e.name));
+                assert_eq!(
+                    text.contains("not in this FFmpeg"),
+                    missing,
+                    "{codec:?}:\n{text}"
+                );
+            }
+        }
+        OPEN_ENCODER_LIST.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

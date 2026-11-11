@@ -268,11 +268,16 @@ The README describes the features; this file is about working on the code.
   software, label, `usable_here`, `protocol_problem`: SRT carries only H.264 and H.265, found by publishing each to
   a real MediaMTX) and `stream::video_args` builds the arguments per encoder (`h264_args`, `hevc_stream_args`,
   `av1_stream_args`, `vp9_stream_args`; a keyframe every two seconds and no B-frames for all; AV1/VP9 over RTSP
-  also get `-strict experimental`; SVT-AV1 refuses `-maxrate`; libvpx needs `-lag-in-frames 0` or it buffers a
-  second; Kvazaar needs a size that is a multiple of 8, `KVAZAAR_FILTER`; the Direct3D 12 and VAAPI ones take
+  also get `-strict experimental`; SVT-AV1 is run in its real-time mode (`-svtav1-params rtc=1:rc=2`; the default is random
+  access with variable rate, about 1.5 s behind live, and it refuses `rtc=1` with variable rate, not `-maxrate`);
+  libvpx needs `-lag-in-frames 0` or it buffers a
+  second; Kvazaar needs a size that is a multiple of 8, `KVAZAAR_FILTER`, and its low-delay
+  pattern `gop=lp-g4d3t1` with `period` set (its presets make B-frames and FFmpeg's wrapper ignores `-bf 0`); the Direct3D 12 and VAAPI ones take
   `-vf format=nv12,hwupload` and a device). Automatic is `stream::auto_encoder` (`server_encoder` checks a chosen one
   makes the stream's codec); `test_encoder` (the Send out list's Test encoders button, via `ui::encoder_picker`) encodes
-  3 s and counts keyframes with ffprobe, and `explain_failure` turns FFmpeg's complaint into words. The H.264
+  3 s and checks the packets with ffprobe (`packet_facts`: keyframes, and that the pictures are in order, so no
+  B-frames), and `explain_failure` turns FFmpeg's complaint into words. What FFmpeg has (`caps`) is asked on a
+  thread (`caps_ready`), never by the interface; a run of the tests is one for the whole program (`encoder_tests`). The H.264
   encoder for Automatic comes from
   `stream::encoder` (libx264, then VideoToolbox, NVENC, QSV, AMF, OpenH264: listed *and* proven by a short
   test encode, once per run), and `missing_for` checks the muxer and protocol (the Mac bundle has

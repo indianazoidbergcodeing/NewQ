@@ -494,8 +494,8 @@ stays on the computer until you send it yourself.
     then makes it a camera for Zoom or Teams. This is the way on **Windows and
     macOS**, where a virtual camera needs a signed driver or system extension
     that NewQ doesn't have. It runs about half a second behind.
-  - *Streaming server (MediaMTX)*: publishes the picture, as H.264 with no
-    sound, to a streaming server such as [MediaMTX](https://github.com/bluenviron/mediamtx),
+  - *Streaming server (MediaMTX)*: publishes the picture, as H.264 (or H.265, AV1
+    or VP9, see below) with no sound, to a streaming server such as [MediaMTX](https://github.com/bluenviron/mediamtx),
     which then serves any number of viewers (VLC, OBS, a browser through
     WebRTC, a media player). Choose *RTSP*, *RTMP* or *SRT*, the server's
     address (the port follows the protocol: 8554, 1935, 8890) and a stream
@@ -507,10 +507,12 @@ stays on the computer until you send it yourself.
     none of them needs a Custom output or an FFmpeg with libx264 (`NEWQ_FFMPEG_DIR`).
     *Video* picks the codec: **H.264** (every viewer can play it, a browser
     too), **H.265**, **AV1** or **VP9**. *Encoder* lists the encoders of that codec
-    that this computer's FFmpeg has, graphics card (hardware) first and then
-    processor (software), and picks one by hand (Automatic uses the first that
+    that this kind of computer can have, graphics card (hardware) first and then
+    processor (software), with those this computer's FFmpeg lacks marked "not in
+    this FFmpeg" and not selectable, and picks one by hand (Automatic uses the first that
     works). **Test encoders** tries each on a few seconds of picture and says which
-    work here, with a plain reason for the ones that don't ("no NVIDIA graphics card or
+    work here (the first time it opens, the list waits a moment while NewQ asks
+    FFmpeg what it has), with a plain reason for the ones that don't ("no NVIDIA graphics card or
     driver here") and a warning for one that doesn't send a keyframe about every
     second. The encoders NewQ can use (a list, not a menu that pops up, so none is
     cut off at the bottom of the window): H.264: NVIDIA NVENC, AMD AMF, Intel Quick
@@ -526,7 +528,11 @@ stays on the computer until you send it yourself.
     code); VLC, OBS and FFmpeg do. Hardware encoders for NVIDIA, Intel and VAAPI have not
     been tried on that hardware; AMD AMF, Media Foundation and Direct3D 12 have, on a
     Radeon, and Kvazaar needs a picture whose size is a multiple of 8, so it is trimmed
-    by up to 7 pixels.
+    by up to 7 pixels, and is set to Kvazaar's low-delay frame pattern (its presets reorder
+    frames, which a browser's player can't show). SVT-AV1 runs in its real-time mode (SVT-AV1
+    2.0 or newer): in its default mode it sends about a second and a half behind. The
+    test also fails an encoder that sends frames out of order. On a Linux computer with two
+    graphics cards, VAAPI uses the first render device; `NEWQ_VAAPI_DEVICE` names another.
     (AMD AMF did exactly that until its *low latency* mode was dropped: it sent one
     keyframe and never another, so anyone who joined the stream late, or whose
     connection dropped and came back, saw nothing.)
