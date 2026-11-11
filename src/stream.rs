@@ -176,7 +176,10 @@ pub fn h264_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "h264_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
         "h264_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
         "h264_d3d12va" => add(&D3D12_ARGS),
-        "h264_vaapi" => add(&VAAPI_ARGS),
+        "h264_vaapi" => {
+            let device = vaapi_device();
+            add(&["-vaapi_device", &device, "-vf", "format=nv12,hwupload"])
+        }
         "libopenh264" => add(&["-allow_skip_frames", "0", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
@@ -215,13 +218,27 @@ fn add_filter(args: &mut Vec<String>, filter: &str) {
     }
 }
 
-/// The same for VAAPI (Linux: Intel and AMD).
-const VAAPI_ARGS: [&str; 4] = [
-    "-vaapi_device",
-    "/dev/dri/renderD128",
-    "-vf",
-    "format=nv12,hwupload",
-];
+/// The render device VAAPI encodes on (Linux: Intel and AMD): `NEWQ_VAAPI_DEVICE` if set, else the first
+/// `/dev/dri/renderD*` there is (a computer with two graphics cards has two), else the usual first one.
+fn vaapi_device() -> String {
+    if let Ok(d) = std::env::var("NEWQ_VAAPI_DEVICE")
+        && !d.trim().is_empty()
+    {
+        return d.trim().to_string();
+    }
+    let mut found: Vec<String> = std::fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("renderD"))
+        .collect();
+    found.sort();
+    found.first().map_or_else(
+        || "/dev/dri/renderD128".to_string(),
+        |n| format!("/dev/dri/{n}"),
+    )
+}
 
 /// H.265 encoders to try, best first, as for `H264_ENCODERS`.
 const HEVC_ENCODERS: [&str; 6] = [
@@ -257,7 +274,10 @@ pub fn hevc_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "hevc_amf" => add(&["-usage", "transcoding", "-pix_fmt", "yuv420p"]),
         "hevc_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
         "hevc_d3d12va" => add(&D3D12_ARGS),
-        "hevc_vaapi" => add(&VAAPI_ARGS),
+        "hevc_vaapi" => {
+            let device = vaapi_device();
+            add(&["-vaapi_device", &device, "-vf", "format=nv12,hwupload"])
+        }
         "libkvazaar" => add(&["-kvazaar-params", "preset=veryfast", "-pix_fmt", "yuv420p"]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
@@ -305,15 +325,24 @@ pub fn hevc_stream_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "hevc_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
         "hevc_mf" => add(&["-hw_encoding", "1", "-pix_fmt", "nv12"]),
         "hevc_d3d12va" => add(&D3D12_ARGS),
-        "hevc_vaapi" => add(&VAAPI_ARGS),
-        "libkvazaar" => add(&[
-            "-kvazaar-params",
-            "preset=ultrafast",
-            "-vf",
-            KVAZAAR_FILTER,
-            "-pix_fmt",
-            "yuv420p",
-        ]),
+        "hevc_vaapi" => {
+            let device = vaapi_device();
+            add(&["-vaapi_device", &device, "-vf", "format=nv12,hwupload"])
+        }
+        // The preset's own frame pyramid reorders frames (and FFmpeg's wrapper ignores `-bf 0`), which a
+        // browser's player can't show: `lp-g4d3t1` is Kvazaar's low-delay pattern, and `period` sets the
+        // keyframe spacing exactly (it would round up to a multiple of the pattern otherwise).
+        "libkvazaar" => {
+            let params = format!("preset=ultrafast,gop=lp-g4d3t1,period={}", fps.max(1) * 2);
+            add(&[
+                "-kvazaar-params",
+                &params,
+                "-vf",
+                KVAZAAR_FILTER,
+                "-pix_fmt",
+                "yuv420p",
+            ])
+        }
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
     a.extend(live_rate_args(kbps, fps));
@@ -328,18 +357,20 @@ pub fn av1_stream_args(encoder: &str, kbps: u32, fps: u32) -> Vec<String> {
         "av1_nvenc" => add(&["-preset", "p4", "-tune", "ll", "-pix_fmt", "yuv420p"]),
         "av1_amf" => add(&["-usage", "webcam", "-pix_fmt", "yuv420p"]),
         "av1_qsv" => add(&["-preset", "veryfast", "-pix_fmt", "nv12"]),
-        // Presets 10 to 12 are the real-time ones.
-        "libsvtav1" => add(&["-preset", "10", "-pix_fmt", "yuv420p"]),
+        // Real-time mode (`rtc=1`, with constant rate, `rc=2`): a low-delay frame pattern, so it
+        // sends at once instead of about a second and a half behind, and no "visual artifacts may occur"
+        // warning. (SVT-AV1 2.0 or newer; it refuses `rtc=1` with variable rate.)
+        "libsvtav1" => add(&[
+            "-preset",
+            "10",
+            "-svtav1-params",
+            "rtc=1:rc=2",
+            "-pix_fmt",
+            "yuv420p",
+        ]),
         _ => add(&["-pix_fmt", "yuv420p"]),
     }
-    let mut rate = live_rate_args(kbps, fps);
-    // SVT-AV1 refuses a `-maxrate` (it fails to start).
-    if encoder == "libsvtav1"
-        && let Some(at) = rate.iter().position(|x| x == "-maxrate")
-    {
-        rate.drain(at..at + 2);
-    }
-    a.extend(rate);
+    a.extend(live_rate_args(kbps, fps));
     a
 }
 
@@ -780,13 +811,36 @@ fn encoder_works(ff: &Ffmpeg, encoder: &str) -> bool {
     }
 }
 
+static CAPS: OnceLock<Caps> = OnceLock::new();
+
 fn caps(ff: &Ffmpeg) -> &'static Caps {
-    static CACHE: OnceLock<Caps> = OnceLock::new();
-    CACHE.get_or_init(|| Caps {
+    CAPS.get_or_init(|| Caps {
         encoders: ask(ff, "-encoders"),
         muxers: ask(ff, "-muxers"),
         protocols: ask(ff, "-protocols"),
     })
+}
+
+/// Whether what this FFmpeg has is known yet. If not, it starts finding out on a thread (three
+/// FFmpeg runs, which can take seconds on a slow start), so the interface never waits for it:
+/// ask again a moment later.
+pub fn caps_ready(ff: &Ffmpeg) -> bool {
+    if CAPS.get().is_some() {
+        return true;
+    }
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let ff = ff.clone();
+        let started = std::thread::Builder::new()
+            .name("ffmpeg-caps".into())
+            .spawn(move || {
+                caps(&ff);
+            });
+        if started.is_err() {
+            STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    false
 }
 
 /// The H.264 encoder to use with `ff`, if there is one that works. A working
@@ -924,9 +978,11 @@ pub fn test_encoder(ff: &Ffmpeg, name: &str) -> EncoderTest {
         VideoCodec::H264 | VideoCodec::H265 => ("ts", "mpegts"),
         VideoCodec::Av1 | VideoCodec::Vp9 => ("mkv", "matroska"),
     };
+    static TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let file = std::env::temp_dir().join(format!(
-        "newq-encoder-test-{}-{}.{extension}",
+        "newq-encoder-test-{}-{}-{}.{extension}",
         std::process::id(),
+        TESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         name
     ));
     let mut cmd = ff.command();
@@ -968,13 +1024,20 @@ pub fn test_encoder(ff: &Ffmpeg, name: &str) -> EncoderTest {
         let _ = std::fs::remove_file(&file);
         return EncoderTest::Failed(explain_failure(&said, name));
     }
-    let keyframes = count_keyframes(ff, &file);
+    let facts = packet_facts(ff, &file);
     let _ = std::fs::remove_file(&file);
-    match keyframes {
-        Some(n) if n < 2 => EncoderTest::Failed(format!(
-            "it sent {n} keyframe(s) in 3 seconds: a viewer joining late would see nothing"
+    match facts {
+        Some(f) if !f.in_order => EncoderTest::Failed(
+            "it sends frames out of order (B-frames), which a web browser's player can't show"
+                .into(),
+        ),
+        Some(f) if f.keyframes < 2 => EncoderTest::Failed(format!(
+            "it sent {} keyframe(s) in 3 seconds: a viewer joining late would see nothing",
+            f.keyframes
         )),
-        other => EncoderTest::Works { keyframes: other },
+        other => EncoderTest::Works {
+            keyframes: other.map(|f| f.keyframes),
+        },
     }
 }
 
@@ -1023,22 +1086,46 @@ fn explain_failure(said: &str, name: &str) -> String {
         .unwrap_or_else(|| "it failed".to_string())
 }
 
-/// How many keyframes `file` has, if FFmpeg's `ffprobe` is there to say.
-fn count_keyframes(ff: &Ffmpeg, file: &std::path::Path) -> Option<u32> {
+/// What the packets of a file of video show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketFacts {
+    /// How many are keyframes.
+    pub keyframes: u32,
+    /// Whether the pictures are in the order they are shown in (no B-frames).
+    pub in_order: bool,
+}
+
+/// The keyframes of `file` and whether its pictures are in order, if FFmpeg's `ffprobe` is there to say.
+pub fn packet_facts(ff: &Ffmpeg, file: &std::path::Path) -> Option<PacketFacts> {
     let mut cmd = Command::new(&ff.ffprobe);
     cmd.args(["-v", "error", "-select_streams", "v"])
-        .args(["-show_entries", "packet=flags", "-of", "csv=p=0"])
+        .args(["-show_entries", "packet=pts,flags", "-of", "csv=p=0"])
         .arg(file);
     crate::media::ffmpeg::no_console(&mut cmd);
     let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
-    let n = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains('K'))
-        .count();
-    u32::try_from(n).ok()
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut keyframes, mut highest, mut in_order) = (0u32, i64::MIN, true);
+    for line in text.lines() {
+        let (pts, flags) = line.split_once(',').unwrap_or((line, ""));
+        if flags.contains('K') {
+            keyframes += 1;
+        }
+        // Packets come in the order they are decoded; a picture that is shown before one
+        // that came earlier is a B-frame.
+        if let Ok(pts) = pts.trim().parse::<i64>() {
+            if pts < highest {
+                in_order = false;
+            }
+            highest = highest.max(pts);
+        }
+    }
+    Some(PacketFacts {
+        keyframes,
+        in_order,
+    })
 }
 
 /// Why `ff` can't publish `protocol`, if it can't.
@@ -1306,10 +1393,16 @@ impl Sink {
                 fps.to_string(),
             ])?
         } else {
-            if let StreamKind::Server { protocol, .. } = kind
-                && let Some(why) = missing_for(ff, *protocol)
+            if let StreamKind::Server {
+                protocol, codec, ..
+            } = kind
             {
-                return Err(why);
+                if let Some(why) = crate::encoders::protocol_problem(*codec, *protocol) {
+                    return Err(why);
+                }
+                if let Some(why) = missing_for(ff, *protocol) {
+                    return Err(why);
+                }
             }
             if matches!(kind, StreamKind::DeckLink { .. })
                 && !crate::media::camera::ffmpeg_has_decklink_output(ff)
@@ -2419,9 +2512,32 @@ mod tests {
         // The rate is kept in range.
         assert!(video_args("libsvtav1", 5, 30).contains(&"200k".to_string()));
         assert!(video_args("libsvtav1", 9_000_000, 30).contains(&"100000k".to_string()));
-        // SVT-AV1 fails to start with a -maxrate; the others are given one.
-        assert!(!video_args("libsvtav1", 4000, 30).contains(&"-maxrate".to_string()));
-        assert!(video_args("libvpx-vp9", 4000, 30).contains(&"-maxrate".to_string()));
+        // Every one is given a maximum rate; SVT-AV1 in its real-time mode takes one.
+        for e in crate::encoders::ALL {
+            assert!(
+                video_args(e.name, 4000, 30).contains(&"-maxrate".to_string()),
+                "{}",
+                e.name
+            );
+        }
+        assert!(
+            video_args("libsvtav1", 4000, 30)
+                .join(" ")
+                .contains("-svtav1-params rtc=1:rc=2")
+        );
+        // Kvazaar: low-delay frames only and the keyframe spacing exact, for any frame rate.
+        for (fps, period) in [(30, 60), (25, 50), (24, 48), (60, 120)] {
+            let a = video_args("libkvazaar", 4000, fps).join(" ");
+            assert!(
+                a.contains(&format!("preset=ultrafast,gop=lp-g4d3t1,period={period}")),
+                "{a}"
+            );
+        }
+        // The VAAPI device is one that is there, or the usual first one.
+        assert!(
+            vaapi_device().starts_with("/dev/dri/")
+                || std::env::var_os("NEWQ_VAAPI_DEVICE").is_some()
+        );
     }
 
     #[test]
@@ -2517,14 +2633,14 @@ mod tests {
         }
         assert!(server_encoder(&ff, VideoCodec::Av1, "nonsense").is_err());
         // One it doesn't have is Missing, not a failure.
-        assert_eq!(
-            test_encoder(&ff, "libx264").clone(),
-            if encoder_present(&ff, "libx264") {
-                test_encoder(&ff, "libx264")
-            } else {
-                EncoderTest::Missing
-            }
-        );
+        if encoder_present(&ff, "libx264") {
+            assert!(matches!(
+                test_encoder(&ff, "libx264"),
+                EncoderTest::Works { .. }
+            ));
+        } else {
+            assert_eq!(test_encoder(&ff, "libx264"), EncoderTest::Missing);
+        }
         // The software encoders are on every computer: they must work, and send a keyframe a second.
         let mut tried = 0;
         for name in [
@@ -2541,12 +2657,8 @@ mod tests {
             tried += 1;
             match test_encoder(&ff, name) {
                 EncoderTest::Works { keyframes } => {
-                    if let Some(n) = keyframes {
-                        assert!(
-                            (2..=4).contains(&n),
-                            "{name}: about one a second for 3 seconds, got {n}"
-                        );
-                    }
+                    // 90 frames with a keyframe every 30: 0, 30 and 60.
+                    assert_eq!(keyframes, Some(3), "{name}: one a second for 3 seconds");
                 }
                 other => panic!("{name}: {other:?}"),
             }
@@ -2583,6 +2695,164 @@ mod tests {
         {
             eprintln!("{}: {:?}", e.name, test_encoder(&ff, e.name));
         }
+    }
+
+    #[test]
+    fn the_packet_check_tells_frames_in_order_from_b_frames_and_every_software_encoder_is_in_order()
+    {
+        let Some(ff) = Ffmpeg::locate() else {
+            if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+                panic!("NEWQ_REQUIRE_MEDIA is set but ffmpeg was not found");
+            }
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("newq_packets_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let encode = |args: Vec<String>, file: &std::path::Path| {
+            let out = ff
+                .command()
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=640x360:rate=30",
+                    "-t",
+                    "6",
+                ])
+                .args(args)
+                .args(["-f", "mpegts"])
+                .arg(file)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Kvazaar as it came (its preset's own frame pyramid) reorders frames; as set now it does not.
+        if encoder_present(&ff, "libkvazaar") {
+            let old = dir.join("pyramid.ts");
+            let args = [
+                "-c:v",
+                "libkvazaar",
+                "-kvazaar-params",
+                "preset=ultrafast",
+                "-bf",
+                "0",
+            ]
+            .map(String::from)
+            .to_vec();
+            encode(args, &old);
+            let facts = packet_facts(&ff, &old).unwrap();
+            assert!(
+                !facts.in_order,
+                "a pyramid of B-frames was not noticed: {facts:?}"
+            );
+            let now = dir.join("low_delay.ts");
+            encode(video_args("libkvazaar", 2000, 30), &now);
+            assert_eq!(
+                packet_facts(&ff, &now),
+                Some(PacketFacts {
+                    keyframes: 3,
+                    in_order: true
+                })
+            );
+        }
+        // Every software encoder: in order, a keyframe every two seconds.
+        for name in [
+            "libopenh264",
+            "libkvazaar",
+            "libx264",
+            "libx265",
+            "libsvtav1",
+            "libvpx-vp9",
+        ] {
+            if !encoder_present(&ff, name) {
+                continue;
+            }
+            let file = dir.join(format!("{name}.ts"));
+            let matroska = dir.join(format!("{name}.mkv"));
+            let (path, container) = if matches!(name, "libsvtav1" | "libvpx-vp9") {
+                (&matroska, "matroska")
+            } else {
+                (&file, "mpegts")
+            };
+            let out = ff
+                .command()
+                .args([
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=640x360:rate=30",
+                    "-t",
+                    "6",
+                ])
+                .args(video_args(name, 2000, 30))
+                .args(["-f", container])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                packet_facts(&ff, path),
+                Some(PacketFacts {
+                    keyframes: 3,
+                    in_order: true
+                }),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn what_ffmpeg_has_is_found_off_the_interfaces_thread_and_an_impossible_codec_is_refused_at_once()
+     {
+        use crate::show::VideoCodec;
+        let Some(ff) = Ffmpeg::locate() else {
+            if std::env::var_os("NEWQ_REQUIRE_MEDIA").is_some() {
+                panic!("NEWQ_REQUIRE_MEDIA is set but ffmpeg was not found");
+            }
+            return;
+        };
+        // Asked, it answers "not yet" or yes at once, and is ready soon.
+        let t0 = std::time::Instant::now();
+        let mut ready = caps_ready(&ff);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "the first ask waited for FFmpeg: {:?}",
+            t0.elapsed()
+        );
+        for _ in 0..200 {
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            ready = caps_ready(&ff);
+        }
+        assert!(ready, "FFmpeg's list never came");
+        // AV1 over SRT is refused before any encoder is tried.
+        let mut kind = StreamKind::server(ServerProtocol::Srt);
+        if let StreamKind::Server { codec, .. } = &mut kind {
+            *codec = VideoCodec::Av1;
+        }
+        let t0 = std::time::Instant::now();
+        let why = match Sink::start(&ff, (320, 180), 25, &kind) {
+            Err(why) => why,
+            Ok(_) => panic!("AV1 over SRT started"),
+        };
+        assert!(why.contains("SRT") && why.contains("RTSP"), "{why}");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "it tried encoders first"
+        );
     }
 
     #[test]

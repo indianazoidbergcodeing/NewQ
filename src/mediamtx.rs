@@ -1063,6 +1063,26 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// Run `cmd` and collect what it says, but kill it after `limit` (a reader waiting on a
+    /// stream that is not there must not hold the test for ever).
+    fn run_within(mut cmd: std::process::Command, limit: Duration) -> std::process::Output {
+        use std::process::Stdio;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("start FFmpeg");
+        let deadline = std::time::Instant::now() + limit;
+        while child.try_wait().ok().flatten().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        child.wait_with_output().expect("FFmpeg's output")
+    }
+
+    /// Every codec NewQ can send, over each protocol that should carry it, with the
     /// Every codec NewQ can send, over each protocol that should carry it, with the
     /// software encoder (every computer has one), to a real MediaMTX, read back as
     /// a viewer would. This is what the protocol table in `encoders` rests on.
@@ -1158,13 +1178,12 @@ mod tests {
                 let mut got = None;
                 let mut last_error = String::new();
                 for _ in 0..40 {
-                    let out = ff
-                        .command()
+                    let mut reader = ff.command();
+                    reader
                         .args(["-rtsp_transport", "tcp", "-i"])
                         .arg(format!("rtsp://127.0.0.1:{}/{name}", hosting.rtsp))
-                        .args(["-frames:v", "5", "-f", "null", "-"])
-                        .output()
-                        .unwrap();
+                        .args(["-frames:v", "5", "-f", "null", "-"]);
+                    let out = run_within(reader, Duration::from_secs(10));
                     if out.status.success() {
                         got = Some(());
                         break;
