@@ -513,8 +513,8 @@ stays on the computer until you send it yourself.
     works). **Test encoders** tries each on a few seconds of picture and says which
     work here (the first time it opens, the list waits a moment while NewQ asks
     FFmpeg what it has), with a plain reason for the ones that don't ("no NVIDIA graphics card or
-    driver here") and a warning for one that doesn't send a keyframe about every
-    second. The encoders NewQ can use (a list, not a menu that pops up, so none is
+    driver here") and a failure for one that sends too few keyframes (about one
+    every two seconds is expected) or sends pictures out of order. The encoders NewQ can use (a list, not a menu that pops up, so none is
     cut off at the bottom of the window): H.264: NVIDIA NVENC, AMD AMF, Intel Quick
     Sync, Apple VideoToolbox, Windows Media Foundation, Direct3D 12 (any graphics
     card, Windows), VAAPI (Linux), x264 and OpenH264; H.265: the same hardware ones,

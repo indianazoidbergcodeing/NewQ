@@ -723,8 +723,9 @@ pub fn output_args_to(
 }
 
 const NO_H264: &str = "This computer's FFmpeg has no H.264 encoder that works here (libx264, or \
-    OpenH264, or NVENC, Quick Sync, AMF, Media Foundation or Direct3D 12 with its hardware): \
-    use a Custom FFmpeg output or install an FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
+    OpenH264, or NVENC, Quick Sync or AMF with its hardware; Media Foundation, Direct3D 12 and \
+    VAAPI can be chosen by hand in the Encoder list): use a Custom FFmpeg output or install an \
+    FFmpeg with libx264 and point NEWQ_FFMPEG_DIR at it";
 
 /// What to say when no encoder of `codec` works here.
 fn no_encoder(codec: crate::show::VideoCodec) -> String {
@@ -743,7 +744,8 @@ fn no_encoder(codec: crate::show::VideoCodec) -> String {
 }
 
 const NO_HEVC: &str = "This computer's FFmpeg has no H.265 encoder that works here (libx265, \
-    Kvazaar, or NVENC, Quick Sync, AMF, Media Foundation or Direct3D 12 with its hardware): use \
+    Kvazaar, or NVENC, Quick Sync or AMF with its hardware; Media Foundation, Direct3D 12 and VAAPI \
+    can be chosen by hand in the Encoder list): use \
     H.264, or install an FFmpeg with libx265 and point NEWQ_FFMPEG_DIR at it";
 
 /// What this FFmpeg can do, asked once: its encoders, muxers and protocols.
@@ -825,19 +827,28 @@ fn caps(ff: &Ffmpeg) -> &'static Caps {
 /// FFmpeg runs, which can take seconds on a slow start), so the interface never waits for it:
 /// ask again a moment later.
 pub fn caps_ready(ff: &Ffmpeg) -> bool {
-    if CAPS.get().is_some() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let ff = ff.clone();
+    ready_or_start(&CAPS, &STARTED, move || {
+        caps(&ff);
+    })
+}
+
+/// Whether `cell` is filled; if not, `fill` (which fills it) is started once on a thread.
+fn ready_or_start<T: 'static>(
+    cell: &'static OnceLock<T>,
+    started: &'static std::sync::atomic::AtomicBool,
+    fill: impl FnOnce() + Send + 'static,
+) -> bool {
+    if cell.get().is_some() {
         return true;
     }
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        let ff = ff.clone();
-        let started = std::thread::Builder::new()
+    if !started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let spawned = std::thread::Builder::new()
             .name("ffmpeg-caps".into())
-            .spawn(move || {
-                caps(&ff);
-            });
-        if started.is_err() {
-            STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            .spawn(fill);
+        if spawned.is_err() {
+            started.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
     false
@@ -2709,8 +2720,11 @@ mod tests {
             tried += 1;
             match test_encoder(&ff, name) {
                 EncoderTest::Works { keyframes } => {
-                    // 90 frames with a keyframe every 30: 0, 30 and 60.
-                    assert_eq!(keyframes, Some(3), "{name}: one a second for 3 seconds");
+                    // 3 seconds with a keyframe every 2: about 2 (an encoder may add one of its own).
+                    assert!(
+                        keyframes.is_some_and(|n| (2..=5).contains(&n)),
+                        "{name}: a keyframe every two seconds, got {keyframes:?}"
+                    );
                 }
                 other => panic!("{name}: {other:?}"),
             }
@@ -2804,12 +2818,10 @@ mod tests {
             );
             let now = dir.join("low_delay.ts");
             encode(video_args("libkvazaar", 2000, 30), &now);
-            assert_eq!(
-                packet_facts(&ff, &now),
-                Some(PacketFacts {
-                    keyframes: 3,
-                    in_order: true
-                })
+            let facts = packet_facts(&ff, &now).unwrap();
+            assert!(
+                facts.in_order && (3..=5).contains(&facts.keyframes),
+                "{facts:?}"
             );
         }
         // Every software encoder: in order, a keyframe every two seconds.
@@ -2852,16 +2864,50 @@ mod tests {
                 "{name}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            assert_eq!(
-                packet_facts(&ff, path),
-                Some(PacketFacts {
-                    keyframes: 3,
-                    in_order: true
-                }),
-                "{name}"
+            let facts = packet_facts(&ff, path).unwrap();
+            // 6 seconds with a keyframe every 2: 3 (an encoder may add one of its own).
+            assert!(
+                facts.in_order && (3..=5).contains(&facts.keyframes),
+                "{name}: {facts:?}"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_slow_lookup_is_started_once_and_the_caller_never_waits_for_it() {
+        // Its own cell, so nothing another test has filled can make this pass for free.
+        static CELL: OnceLock<u32> = OnceLock::new();
+        static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let fill = || {
+            RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let _ = CELL.set(7);
+        };
+        let t0 = std::time::Instant::now();
+        assert!(!ready_or_start(&CELL, &STARTED, fill));
+        assert!(!ready_or_start(&CELL, &STARTED, fill));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(300),
+            "the ask waited for the lookup: {:?}",
+            t0.elapsed()
+        );
+        let mut ready = false;
+        for _ in 0..100 {
+            if ready_or_start(&CELL, &STARTED, fill) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ready, "the lookup never finished");
+        assert_eq!(CELL.get(), Some(&7));
+        assert_eq!(
+            RUNS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "started more than once"
+        );
     }
 
     #[test]

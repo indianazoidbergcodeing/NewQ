@@ -5062,10 +5062,12 @@ impl Drop for TestsDone {
     }
 }
 
-/// In a test: have the list of encoders open at once, as a click on it would.
+/// In a test: have the list of encoders open at once, as a click on it would. Per thread,
+/// so a test that draws the editor on another thread is not affected.
 #[cfg(test)]
-pub(crate) static OPEN_ENCODER_LIST: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    pub(crate) static OPEN_ENCODER_LIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// The encoders of `codec` as a list to choose from: Automatic, then the graphics
 /// card's and the processor's, each marked when this FFmpeg doesn't have it, and
@@ -5083,10 +5085,15 @@ fn encoder_picker(
     let shown = if encoder.is_empty() {
         "Automatic".to_string()
     } else {
-        encoders::find(encoder).map_or_else(|| encoder.clone(), |e| e.full_label())
+        // A show saved on another kind of computer can name an encoder this one cannot have.
+        match encoders::find(encoder) {
+            Some(e) if e.usable_here() => e.full_label(),
+            Some(e) => format!("{} (not on this computer)", e.full_label()),
+            None => format!("{encoder} (unknown encoder)"),
+        }
     };
     #[cfg(test)]
-    let open = OPEN_ENCODER_LIST.load(std::sync::atomic::Ordering::Relaxed);
+    let open = OPEN_ENCODER_LIST.with(|f| f.get());
     #[cfg(not(test))]
     let open = false;
     ui.vertical(|ui| {
@@ -14542,7 +14549,7 @@ mod tests {
             }
             assert!(crate::stream::caps_ready(ff), "FFmpeg's list never came");
         }
-        OPEN_ENCODER_LIST.store(true, std::sync::atomic::Ordering::Relaxed);
+        OPEN_ENCODER_LIST.with(|f| f.set(true));
         let ctx = egui::Context::default();
         let mut t = 1.0;
         let cases: [(VideoCodec, &[&str]); 4] = [
@@ -14623,7 +14630,7 @@ mod tests {
                 );
             }
         }
-        OPEN_ENCODER_LIST.store(false, std::sync::atomic::Ordering::Relaxed);
+        OPEN_ENCODER_LIST.with(|f| f.set(false));
     }
 
     #[test]

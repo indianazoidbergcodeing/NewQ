@@ -88,6 +88,13 @@ impl Encoder {
         } else {
             None
         };
+        // NVIDIA, AMD and Intel's own encoders exist for Windows and Linux, not a Mac.
+        let not_on_a_mac = self.name.ends_with("_nvenc")
+            || self.name.ends_with("_amf")
+            || self.name.ends_with("_qsv");
+        if not_on_a_mac && std::env::consts::OS == "macos" {
+            return false;
+        }
         only.is_none_or(|os| std::env::consts::OS == os)
     }
 
@@ -210,7 +217,11 @@ mod tests {
         assert_eq!(here("h264_mf"), cfg!(windows));
         assert_eq!(here("hevc_d3d12va"), cfg!(windows));
         assert_eq!(here("h264_videotoolbox"), cfg!(target_os = "macos"));
-        assert!(here("av1_nvenc") && here("libsvtav1"));
+        assert!(here("libsvtav1"));
+        // Not on a Mac: NVIDIA, AMD and Intel hardware encoders.
+        for n in ["av1_nvenc", "h264_amf", "hevc_qsv", "vp9_qsv"] {
+            assert_eq!(here(n), !cfg!(target_os = "macos"), "{n}");
+        }
     }
 
     #[test]
