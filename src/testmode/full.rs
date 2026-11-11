@@ -492,6 +492,7 @@ impl FullRun {
                             adapter: crate::streamlink::LOOPBACK.into(),
                             player_port: player,
                             host_here: true,
+                            codec: crate::show::VideoCodec::H264,
                             encoder: String::new(),
                         },
                         fps: 30,

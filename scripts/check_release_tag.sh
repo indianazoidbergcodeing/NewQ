@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # Check that a release tag is well formed and matches the version in
-# Cargo.toml: v1.2.3 or v1.2.3-rc1 for version 1.2.3.
+# Cargo.toml: v1.2.3 or v1.2.3-rc1 for version 1.2.3, and v1.2.3.1 (a fix
+# release of 1.2.3) for version 1.2.3+1, since a Cargo version has three
+# numbers and the fourth goes in its build metadata.
 # Usage: scripts/check_release_tag.sh <tag>      (CARGO_TOML overrides the file)
 set -euo pipefail
 
 tag="${1:-}"
-if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.]+)?$ ]]; then
-  echo "'$tag' is not a release tag like v1.2.3 or v1.2.3-rc1" >&2
+if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(\.([0-9]+))?(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "'$tag' is not a release tag like v1.2.3, v1.2.3.1 or v1.2.3-rc1" >&2
   exit 1
 fi
 want="${BASH_REMATCH[1]}"
+fix="${BASH_REMATCH[3]}"
+if [ -n "$fix" ]; then
+  want="$want+$fix"
+fi
 have="$(sed -n 's/^version = "\(.*\)"$/\1/p' "${CARGO_TOML:-Cargo.toml}" | head -n1)"
 if [ "$have" != "$want" ]; then
   echo "Cargo.toml is version '$have', but $tag is for $want" >&2
