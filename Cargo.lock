@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "newq"
-version = "0.19.1+encoders"
+version = "0.19.1+1"
 dependencies = [
  "ab_glyph",
  "anyhow",

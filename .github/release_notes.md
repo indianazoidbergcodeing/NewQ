@@ -1,3 +1,18 @@
+## What's new in 0.19.1.1
+
+Built on NewQ 0.19.1. Choose how a stream to the server is encoded:
+
+- **Video codec**: H.264, H.265, AV1 or VP9, with a note on which protocols and
+  viewers carry each (SRT cannot carry AV1 or VP9).
+- **Encoder list**: every encoder for the chosen codec, graphics card (NVIDIA
+  NVENC, AMD AMF, Intel Quick Sync, Direct3D 12, VAAPI, Media Foundation)
+  first and then processor (OpenH264, Kvazaar, x264, x265, SVT-AV1, libvpx
+  VP9). Those this FFmpeg lacks are marked and not selectable.
+- **Test encoders**: tries each encoder on this computer and says plainly which
+  work (and why the others don't), checking keyframes and frame order.
+- Live-streaming settings for every encoder: no B-frames, a keyframe every two
+  seconds, SVT-AV1 in real-time mode, Kvazaar low-delay.
+
 ## Downloads
 
 Everything NewQ needs is in the download, including FFmpeg and the MediaMTX
