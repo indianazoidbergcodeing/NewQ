@@ -15,6 +15,7 @@ mod crash;
 mod crumbs;
 mod dock;
 mod edid;
+mod encoders;
 mod engine;
 mod export;
 mod feedback;

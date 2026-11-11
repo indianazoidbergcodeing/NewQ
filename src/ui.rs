@@ -4994,6 +4994,147 @@ fn shared_picture_editor(
 
 /// Sending a display's picture out as video: to a virtual camera (Linux), to
 /// OBS over the network, or anywhere FFmpeg can send it.
+/// What the tests of the encoders have found so far (shared with the thread that runs them).
+#[derive(Default)]
+struct EncoderTests {
+    results: Vec<(&'static str, crate::stream::EncoderTest)>,
+    running: bool,
+}
+
+/// The encoders of `codec` as a list to choose from: Automatic, then the graphics
+/// card's and the processor's, each marked when this FFmpeg doesn't have it, and
+/// a button that tries them all. It is not a pop-up: those get cut off at the
+/// bottom of the window, and a list that long needs room.
+fn encoder_picker(
+    ui: &mut Ui,
+    key: u64,
+    ff: Option<&crate::media::ffmpeg::Ffmpeg>,
+    codec: crate::show::VideoCodec,
+    encoder: &mut String,
+) {
+    use crate::encoders::{self, Kind};
+    let tests_id = egui::Id::new("newq_encoder_tests");
+    let tests: std::sync::Arc<parking_lot::Mutex<EncoderTests>> = ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<std::sync::Arc<parking_lot::Mutex<EncoderTests>>>(tests_id)
+            .clone()
+    });
+    let shown = if encoder.is_empty() {
+        "Automatic".to_string()
+    } else {
+        encoders::find(encoder).map_or_else(|| encoder.clone(), |e| e.full_label())
+    };
+    ui.vertical(|ui| {
+        egui::CollapsingHeader::new(shown)
+            .id_salt(("encoder_list", key))
+            .default_open(false)
+            .show(ui, |ui| {
+                let found = tests.lock().results.clone();
+                if ui
+                    .selectable_label(encoder.is_empty(), "Automatic (the first that works here)")
+                    .on_hover_text(
+                        "NewQ tries the encoders in turn and uses the first that works. If viewers see \n                         no picture, choose OpenH264 (software) for H.264.",
+                    )
+                    .clicked()
+                {
+                    encoder.clear();
+                }
+                for kind in [Kind::Hardware, Kind::Software] {
+                    let list: Vec<&encoders::Encoder> = encoders::for_codec(codec)
+                        .filter(|e| e.kind == kind && e.usable_here())
+                        .collect();
+                    if list.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(match kind {
+                            Kind::Hardware => "Graphics card (hardware)",
+                            Kind::Software => "Processor (software)",
+                        })
+                        .weak()
+                        .small(),
+                    );
+                    for e in list {
+                        let has = ff.is_some_and(|f| crate::stream::encoder_present(f, e.name));
+                        let chosen = encoder.as_str() == e.name;
+                        ui.horizontal(|ui| {
+                            let r = ui.add_enabled_ui(has || chosen, |ui| {
+                                ui.selectable_label(chosen, e.label).on_hover_text(e.name)
+                            });
+                            if r.inner.clicked() {
+                                *encoder = e.name.to_string();
+                            }
+                            let said = found.iter().find(|(n, _)| *n == e.name).map(|(_, t)| t);
+                            match (has, said) {
+                                (false, _) => {
+                                    ui.label(RichText::new("not in this FFmpeg").weak().small());
+                                }
+                                (true, Some(crate::stream::EncoderTest::Works { keyframes })) => {
+                                    ui.label(
+                                        RichText::new(match keyframes {
+                                            Some(n) => format!("works ({n} keyframes in 3 s)"),
+                                            None => "works".to_string(),
+                                        })
+                                        .color(GO_GREEN)
+                                        .small(),
+                                    );
+                                }
+                                (true, Some(crate::stream::EncoderTest::Failed(why))) => {
+                                    ui.label(RichText::new(why).color(STOP_RED).small());
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
+                }
+                ui.add_space(4.0);
+                let running = tests.lock().running;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!running && ff.is_some(), egui::Button::new("Test encoders"))
+                        .on_hover_text(
+                            "Tries every encoder this FFmpeg has on a few seconds of picture, as a \
+                             stream would use it, and says which work here and whether they send a \
+                             keyframe often enough. A hardware one fails when the computer \
+                             hasn't got that hardware.",
+                        )
+                        .clicked()
+                        && let Some(ff) = ff.cloned()
+                    {
+                        {
+                            let mut t = tests.lock();
+                            t.results.clear();
+                            t.running = true;
+                        }
+                        let shared = tests.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("encoder-tests".into())
+                            .spawn(move || {
+                                for e in encoders::ALL {
+                                    if e.usable_here()
+                                        && crate::stream::encoder_present(&ff, e.name)
+                                    {
+                                        let result = crate::stream::test_encoder(&ff, e.name);
+                                        shared.lock().results.push((e.name, result));
+                                    }
+                                }
+                                shared.lock().running = false;
+                            });
+                        if spawned.is_err() {
+                            tests.lock().running = false;
+                        }
+                    }
+                    if running {
+                        ui.spinner();
+                        ui.label(RichText::new("testing…").weak());
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(250));
+                    }
+                });
+            });
+    });
+}
+
 fn stream_editor(
     ui: &mut Ui,
     d: &mut OutputConfig,
@@ -5335,6 +5476,7 @@ fn stream_editor(
                             adapter,
                             player_port,
                             host_here,
+                            codec,
                             encoder,
                         } => {
                             ui.label("Protocol");
@@ -5431,36 +5573,33 @@ fn stream_editor(
                                     .suffix(" kbps"),
                             );
                             ui.end_row();
-                            ui.label("Encoder");
-                            let shown = if encoder.is_empty() {
-                                "Automatic".to_string()
-                            } else {
-                                format!("{} ({encoder})", crate::stream::encoder_label(encoder))
-                            };
-                            egui::ComboBox::from_id_salt(("stream_encoder", d.id.0))
-                                .selected_text(shown)
-                                .width(220.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(encoder, String::new(), "Automatic");
-                                    for name in crate::stream::encoder_names() {
-                                        ui.selectable_value(
-                                            encoder,
-                                            name.to_string(),
-                                            format!(
-                                                "{} ({name})",
-                                                crate::stream::encoder_label(name)
-                                            ),
-                                        );
+                            ui.label("Video");
+                            ui.horizontal(|ui| {
+                                for c in crate::show::VideoCodec::ALL {
+                                    if ui.selectable_label(*codec == c, c.label()).clicked()
+                                        && *codec != c
+                                    {
+                                        *codec = c;
+                                        // The encoder chosen was for the other codec.
+                                        encoder.clear();
                                     }
-                                })
-                                .response
-                                .on_hover_text(
-                                    "Automatic uses the first encoder that works on this \
-                                     computer. If viewers see no picture, try OpenH264 \
-                                     (software): it works everywhere, with more load on the \
-                                     processor. The log says which one was used.",
-                                );
+                                }
+                            });
                             ui.end_row();
+                            ui.label("Encoder");
+                            encoder_picker(ui, d.id.0, engine.ff.as_ref(), *codec, encoder);
+                            ui.end_row();
+                            if let Some(why) = crate::encoders::protocol_problem(*codec, *protocol)
+                            {
+                                ui.label("");
+                                ui.label(RichText::new(why).color(Color32::from_rgb(230, 160, 40)));
+                                ui.end_row();
+                            }
+                            if let Some(note) = crate::encoders::viewer_note(*codec) {
+                                ui.label("");
+                                ui.label(RichText::new(note).weak().small());
+                                ui.end_row();
+                            }
                         }
                         StreamKind::Custom { args } => {
                             ui.label("FFmpeg output");
@@ -5524,11 +5663,13 @@ fn stream_editor(
                          the device's modes, e.g. 1920x1080 at 30 or 60."
                     }
                     StreamKind::Server { .. } => {
-                        "Publishes H.264 (picture only) to a streaming server such as MediaMTX, \
-                         which hands it to any number of viewers. The server must be running: \
-                         viewers open, for RTSP, rtsp://server:8554/name. Uses libx264 if this \
-                         FFmpeg has it, else the computer's hardware encoder. SRT needs an \
-                         FFmpeg with libsrt (not NewQ's Mac one)."
+                        "Publishes video (picture only; H.264, H.265, AV1 or VP9) to a streaming \
+                         server such as MediaMTX, which hands it to any number of viewers. The \
+                         server must be running: viewers open, for RTSP, rtsp://server:8554/name. \
+                         H.264 plays everywhere, in a browser too. Automatic picks the first \
+                         encoder that works on this computer; the list below Encoder shows what \
+                         there is and can test each. SRT needs an FFmpeg with libsrt (not NewQ's \
+                         Mac one) and carries only H.264 and H.265."
                     }
                     StreamKind::Custom { .. } => {
                         "The arguments that follow the input: the picture arrives as raw RGBA, \
@@ -14212,6 +14353,47 @@ mod tests {
             });
             out.textures_delta.clear();
             assert!(out.shapes.len() > 3);
+        }
+    }
+
+    #[test]
+    fn the_send_out_editor_draws_for_every_codec_with_and_without_an_ffmpeg() {
+        use crate::show::{ServerProtocol, StreamKind, StreamOut, VideoCodec};
+        let ctx = egui::Context::default();
+        let mut t = 1.0;
+        for ffmpeg in [false, true] {
+            for codec in VideoCodec::ALL {
+                for protocol in ServerProtocol::ALL {
+                    let mut show = Show::default();
+                    let mut kind = StreamKind::server(protocol);
+                    if let StreamKind::Server { codec: c, .. } = &mut kind {
+                        *c = codec;
+                    }
+                    show.outputs[0].stream = Some(StreamOut {
+                        enabled: true,
+                        kind,
+                        fps: 30,
+                        height: 720,
+                    });
+                    let mut engine = Engine::for_tests();
+                    if ffmpeg {
+                        engine.ff = crate::media::ffmpeg::Ffmpeg::locate();
+                    }
+                    let st = UiState::default();
+                    let mut d = show.outputs[0].clone();
+                    t += 0.1;
+                    let input = RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 1200.0))),
+                        time: Some(t),
+                        ..Default::default()
+                    };
+                    let mut out = ctx.run_ui(input, |ui| {
+                        stream_editor(ui, &mut d, &mut engine, &st, &[]);
+                    });
+                    out.textures_delta.clear();
+                    assert!(out.shapes.len() > 5, "{codec:?} over {protocol:?}");
+                }
+            }
         }
     }
 

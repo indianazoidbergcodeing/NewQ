@@ -504,9 +504,28 @@ enter, and *Test Mode* downloads its free test media when you start it.
     (VideoToolbox on a Mac, then NVENC, Quick Sync, AMF) or OpenH264, found by
     trying each; if none works the status bar says so, and a computer with
     none of them needs a Custom output or an FFmpeg with libx264 (`NEWQ_FFMPEG_DIR`).
-    *Encoder* on that section picks one by hand (Automatic uses the first that
-    works). If viewers get no picture, try *OpenH264 (software)*: a hardware
-    encoder can pass NewQ's quick test and still send a stream nobody can show.
+    *Video* picks the codec: **H.264** (every viewer can play it, a browser
+    too), **H.265**, **AV1** or **VP9**. *Encoder* lists the encoders of that codec
+    that this computer's FFmpeg has, graphics card (hardware) first and then
+    processor (software), and picks one by hand (Automatic uses the first that
+    works). **Test encoders** tries each on a few seconds of picture and says which
+    work here, with a plain reason for the ones that don't ("no NVIDIA graphics card or
+    driver here") and a warning for one that doesn't send a keyframe about every
+    second. The encoders NewQ can use (a list, not a menu that pops up, so none is
+    cut off at the bottom of the window): H.264: NVIDIA NVENC, AMD AMF, Intel Quick
+    Sync, Apple VideoToolbox, Windows Media Foundation, Direct3D 12 (any graphics
+    card, Windows), VAAPI (Linux), x264 and OpenH264; H.265: the same hardware ones,
+    x265 and Kvazaar; AV1: NVENC (RTX 40 and newer), AMF (RDNA 3 and newer), Quick
+    Sync (Arc and newer) and SVT-AV1; VP9: Quick Sync and libvpx. If viewers get no
+    picture, try *OpenH264 (software)*: a hardware encoder can pass NewQ's quick test
+    and still send a stream nobody can show.
+    Not every protocol carries every codec: RTSP and RTMP carry all four (tried
+    against a real MediaMTX), SRT only H.264 and H.265, and the codec chooser says so.
+    A browser may not play H.265 or AV1 in the web player (and so not from the QR
+    code); VLC, OBS and FFmpeg do. Hardware encoders for NVIDIA, Intel and VAAPI have not
+    been tried on that hardware; AMD AMF, Media Foundation and Direct3D 12 have, on a
+    Radeon, and Kvazaar needs a picture whose size is a multiple of 8, so it is trimmed
+    by up to 7 pixels.
     (AMD AMF did exactly that until its *low latency* mode was dropped: it sent one
     keyframe and never another, so anyone who joined the stream late, or whose
     connection dropped and came back, saw nothing.)
