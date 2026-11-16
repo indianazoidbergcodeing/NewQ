@@ -6,6 +6,10 @@ release page, and a release is refused if it has none.
 
 ## Unreleased
 
+- **Multiview in the Preview pane.** With more than one display, the *Multiview* button above the
+  preview shows all of them at once, each under its name; press it again for the single
+  preview and its menu. Kept per computer.
+
 ## 0.24.0
 
 - **The network test.** On the computer that runs a show network, *Help ▸ Test mode* now offers

@@ -1007,21 +1007,27 @@ pub enum Slot {
     Window(u8),
     /// A stream being sent out (by the number of the stream).
     Capture(u8),
+    /// One tile of the multiview in the Preview pane (by the number of its output): every
+    /// tile draws at its own size in the same frame.
+    Multi(u8),
 }
 
 /// How many windows can draw the same layer at once without sharing a slot.
 const WINDOW_SLOTS: usize = 8;
 /// And how many streams.
 pub const CAPTURE_SLOTS: usize = 2;
-const SLOTS: usize = 2 + WINDOW_SLOTS + CAPTURE_SLOTS;
+/// And how many tiles of the multiview.
+pub const MULTI_SLOTS: usize = 16;
+const SLOTS: usize = 2 + WINDOW_SLOTS + CAPTURE_SLOTS + MULTI_SLOTS;
 
 impl Slot {
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Slot::Preview => 0,
             Slot::Screen => 1,
             Slot::Window(n) => 2 + n as usize % WINDOW_SLOTS,
             Slot::Capture(n) => 2 + WINDOW_SLOTS + n as usize % CAPTURE_SLOTS,
+            Slot::Multi(n) => 2 + WINDOW_SLOTS + CAPTURE_SLOTS + n as usize % MULTI_SLOTS,
         }
     }
 }

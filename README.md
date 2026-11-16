@@ -411,7 +411,10 @@ stays on the computer until you send it yourself.
   look-alikes is only used while all of them are connected. A
   display can't cover the monitor NewQ's main window is on; it stays in the
   main window and the panel says so. The main window has a live preview of
-  any display or sub display; with more than one, a menu above it picks which.
+  any display or sub display; with more than one, a menu above it picks which. *Multiview*
+  (the button beside the menu) shows every one at once, each under its name; press it
+  again to go back to the one chosen. It is kept per computer, and while a display's
+  corners are being edited only that display is shown.
   *Test pattern* shows a picture for lining a display up, with a dropdown of
   twelve beside it (choosing one turns the pattern on; it works the same on
   sub displays, and the choice is saved with the show). *Colour bars and
