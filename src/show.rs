@@ -437,10 +437,14 @@ fn is_default_pattern(p: &PatternKind) -> bool {
 }
 
 /// The pictures a display can show to line it up (see `pattern`). The first
-/// is the one displays have always shown.
+/// is the one a display starts with: SMPTE colour bars, in the shape (16:9 or
+/// 16:10) that suits the display they are shown on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PatternKind {
     #[default]
+    Smpte,
+    Smpte169,
+    Smpte1610,
     Bars,
     Grid,
     Crosshatch,
@@ -456,7 +460,10 @@ pub enum PatternKind {
 }
 
 impl PatternKind {
-    pub const ALL: [PatternKind; 12] = [
+    pub const ALL: [PatternKind; 15] = [
+        PatternKind::Smpte,
+        PatternKind::Smpte169,
+        PatternKind::Smpte1610,
         PatternKind::Bars,
         PatternKind::Grid,
         PatternKind::Crosshatch,
@@ -473,6 +480,9 @@ impl PatternKind {
 
     pub fn label(self) -> &'static str {
         match self {
+            PatternKind::Smpte => "SMPTE colour bars (16:9 or 16:10 to suit)",
+            PatternKind::Smpte169 => "SMPTE colour bars, 16:9",
+            PatternKind::Smpte1610 => "SMPTE colour bars, 16:10",
             PatternKind::Bars => "Colour bars and number",
             PatternKind::Grid => "Grid",
             PatternKind::Crosshatch => "Crosshatch",
@@ -490,6 +500,15 @@ impl PatternKind {
 
     pub fn description(self) -> &'static str {
         match self {
+            PatternKind::Smpte => {
+                "SMPTE colour bars and the display's number, in the 16:9 or 16:10 shape that is nearer the display's own: colour, brightness and black level"
+            }
+            PatternKind::Smpte169 => {
+                "SMPTE colour bars in the 16:9 shape, whatever the display's own: colour, brightness and black level"
+            }
+            PatternKind::Smpte1610 => {
+                "SMPTE colour bars in the 16:10 shape, whatever the display's own: colour, brightness and black level"
+            }
             PatternKind::Bars => {
                 "Colour bars with a grid and the display's number: which screen is which, and colour"
             }
@@ -549,6 +568,9 @@ pub struct OutputConfig {
     /// Which test pattern it shows when `test_pattern` is on.
     #[serde(default, skip_serializing_if = "is_default_pattern")]
     pub pattern: PatternKind,
+    /// Whether the patterns that have room for it draw the display's number.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub pattern_number: bool,
     /// Keystone / corner pin applied to everything on a display. (A sub
     /// display's area is its keystone.)
     #[serde(default)]
@@ -618,6 +640,7 @@ impl OutputConfig {
             enabled: true,
             test_pattern: false,
             pattern: PatternKind::default(),
+            pattern_number: true,
             corners: Corners::default(),
             mesh: None,
             part_of: None,
@@ -5175,9 +5198,27 @@ mod tests {
         let mut show = Show::default();
         let plain = serde_json::to_string(&show).unwrap();
         assert!(!plain.contains("\"pattern\""), "{plain}");
-        // A show from before there was a choice loads with the bars.
+        // A show from before there was a choice loads with the SMPTE bars.
         let back: Show = serde_json::from_str(&plain).unwrap();
-        assert_eq!(back.outputs[0].pattern, PatternKind::Bars);
+        assert_eq!(back.outputs[0].pattern, PatternKind::Smpte);
+        // A show that chose the older colour bars keeps them.
+        let old = plain.replacen(
+            "\"test_pattern\":false",
+            "\"test_pattern\":false,\"pattern\":\"Bars\"",
+            1,
+        );
+        assert_ne!(old, plain, "the test edits the file");
+        let kept: Show = serde_json::from_str(&old).unwrap();
+        assert_eq!(kept.outputs[0].pattern, PatternKind::Bars);
+        // The number is on unless turned off, and only "off" is written.
+        assert!(back.outputs[0].pattern_number);
+        assert!(!plain.contains("pattern_number"), "{plain}");
+        show.outputs[0].pattern_number = false;
+        let json = serde_json::to_string(&show).unwrap();
+        assert!(json.contains("\"pattern_number\":false"), "{json}");
+        let off: Show = serde_json::from_str(&json).unwrap();
+        assert!(!off.outputs[0].pattern_number);
+        show.outputs[0].pattern_number = true;
         // Every pattern survives a save and load, and is written under its name.
         for kind in PatternKind::ALL {
             show.outputs[0].pattern = kind;
@@ -5186,7 +5227,7 @@ mod tests {
             let back: Show = serde_json::from_str(&json).unwrap();
             assert_eq!(back.outputs[0].pattern, kind);
             assert!(back.outputs[0].test_pattern);
-            assert_eq!(json.contains("\"pattern\""), kind != PatternKind::Bars);
+            assert_eq!(json.contains("\"pattern\""), kind != PatternKind::Smpte);
         }
     }
 

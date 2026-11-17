@@ -411,11 +411,20 @@ stays on the computer until you send it yourself.
   look-alikes is only used while all of them are connected. A
   display can't cover the monitor NewQ's main window is on; it stays in the
   main window and the panel says so. The main window has a live preview of
-  any display or sub display; with more than one, a menu above it picks which.
+  any display or sub display; with more than one, a menu above it picks which. *Multiview*
+  (the button beside the menu) shows every one at once, each under its name; press it
+  again to go back to the one chosen. It is kept per computer, and while a display's
+  corners are being edited only that display is shown.
   *Test pattern* shows a picture for lining a display up, with a dropdown of
-  twelve beside it (choosing one turns the pattern on; it works the same on
-  sub displays, and the choice is saved with the show). *Colour bars and
-  number* is the one NewQ has always had, for telling which projector is which.
+  fifteen beside it and a *Number* checkbox that turns the display's number
+  on the patterns off (choosing one turns the pattern on; it works the same on
+  sub displays, and the choice is saved with the show). The first, and the one a
+  display starts with, is *SMPTE colour bars*: the 75% bars, the reversed blue
+  row, and the -I, white, +Q and black-level (PLUGE) strips, with the display's
+  number over them. It picks the 16:9 or the 16:10 shape by the shape of the
+  display it is shown on (the side panels are wider on 16:9); *SMPTE colour bars,
+  16:9* and *16:10* force one. *Colour bars and
+  number* is the one NewQ had before, for telling which projector is which.
   The others: *Grid* (squareness and where the picture lands), *Crosshatch*
   (a fine grid of one pixel lines, for straightness when setting a mesh or
   corner pin), *Checkerboard*, *Circles* (round when the shape is right),
