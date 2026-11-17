@@ -6,6 +6,10 @@ release page, and a release is refused if it has none.
 
 ## Unreleased
 
+## 0.24.0.1
+
+Built on NewQ 0.24.0.
+
 - **The number on a test pattern is a setting.** A *Number* checkbox beside a display's (and sub
   display's) *Test pattern* choice turns the display's number on or off. It is on as before, and a
   show only records it when it is off.

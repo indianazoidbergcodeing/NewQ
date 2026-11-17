@@ -227,6 +227,9 @@ Source code: https://github.com/bluenviron/mediamtx
 EOF
     cp "$app/Contents/Resources/MediaMTX/"* "$stage/MediaMTX/"
     rm -rf "$mtx_x64" "$mtx_arm"
+    # Apple takes at most three numbers: a fix release (v1.2.3.1) is 1.2.3 with build 1.2.3.1.
+    short_version="$(echo "${tag#v}" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || true)"
+    short_version="${short_version:-${tag#v}}"
     cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -238,7 +241,7 @@ EOF
   <key>CFBundleExecutable</key><string>newq</string>
   <key>CFBundleIconFile</key><string>newq</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>${tag#v}</string>
+  <key>CFBundleShortVersionString</key><string>${short_version}</string>
   <key>CFBundleVersion</key><string>${tag#v}</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>

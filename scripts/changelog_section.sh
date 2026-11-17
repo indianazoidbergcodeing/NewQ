@@ -6,8 +6,8 @@
 set -euo pipefail
 
 tag="${1:-}"
-if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-[0-9A-Za-z.]+)?$ ]]; then
-  echo "'$tag' is not a release tag like v1.2.3 or v1.2.3-rc1" >&2
+if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)(-[0-9A-Za-z.]+)?$ ]]; then
+  echo "'$tag' is not a release tag like v1.2.3, v1.2.3.1 or v1.2.3-rc1" >&2
   exit 1
 fi
 version="${BASH_REMATCH[1]}"
