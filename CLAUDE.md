@@ -626,7 +626,8 @@ The README describes the features; this file is about working on the code.
   server and a real publish/play-back run when `NEWQ_MEDIAMTX_DIR` (or PATH) has `mediamtx`, else skip.
   `scripts/mediamtx_pins.txt` pins the bundled version, its mirror release and SHA-256s; `package_release.sh::bundle_mediamtx`
   fetches it from this repository's mirror (a universal `lipo` binary on the Mac, signed with the others).
-  `src/pattern.rs`: the twelve test patterns (`show::PatternKind`), drawn on the
+  `src/pattern.rs`: the fifteen test patterns (`show::PatternKind`; the default `Smpte`
+  is resolved to `Smpte169` or `Smpte1610` by the display's size in `pattern::resolve`), drawn on the
   CPU; `app.rs` caches one per display by kind, number and size.
   `src/live_text.rs`: clock and speaker timer text (the engine redraws the
   picture as the shown time changes; the renderer re-uploads on `version`).
